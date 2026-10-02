@@ -1483,6 +1483,7 @@ def timetable_page():
     rows = db.execute("SELECT * FROM timetable WHERE class_name = ?", (cls,)).fetchall()
     grid = timetable_grid(rows)
     periods = range(1, max(grid or [0]) + 1)
+    ocr_ok, ocr_why = timetable_ocr.ocr_status()
     return page("""
       <h1>Thời khóa biểu</h1>
       <form method="post" action="{{ url_for('timetable_scan') }}" enctype="multipart/form-data" class="card">
@@ -1511,7 +1512,7 @@ def timetable_page():
       {% else %}<div class="card empty"><p>Chưa có thời khóa biểu. Chụp ảnh TKB của từng lớp ở form phía trên để
         hệ thống lập lịch chuyển sách giữa các lớp.</p></div>{% endif %}
     """, classes=classes, cls=cls, grid=grid, periods=periods, days=WEEKDAYS, editable=False,
-                ocr_ok=timetable_ocr.ocr_available(), hint=timetable_ocr.INSTALL_HINT)
+                ocr_ok=ocr_ok, hint=ocr_why)
 
 
 @app.post("/timetable/scan")

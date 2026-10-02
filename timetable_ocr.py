@@ -33,12 +33,25 @@ INSTALL_HINT = (
 )
 
 
-def ocr_available():
+def ocr_status():
+    """(True, "") nếu dùng được; ngược lại (False, lý do cụ thể) để giáo viên biết sửa ở đâu."""
+    import sys
     try:
         import paddleocr  # noqa: F401
-        return True
-    except Exception:
-        return False
+    except ModuleNotFoundError as e:
+        if e.name == "paddleocr":
+            return False, ("Python đang chạy app chưa có PaddleOCR. App đang chạy bằng: " + sys.executable +
+                           ". Nếu bạn đã cài PaddleOCR ở môi trường Python khác (vd môi trường của dự án khác), "
+                           "hãy cài vào đúng Python này, hoặc chạy app bằng Python đó (xem README, mục "
+                           "Nhập thời khóa biểu bằng ảnh).")
+        return False, f"PaddleOCR đã cài nhưng thiếu thư viện phụ thuộc: {e.name}. Python đang dùng: {sys.executable}"
+    except Exception as e:   # vd PaddlePaddle lỗi CUDA/DLL khi import
+        return False, f"Không nạp được PaddleOCR ({type(e).__name__}: {e}). Python đang dùng: {sys.executable}"
+    return True, ""
+
+
+def ocr_available():
+    return ocr_status()[0]
 
 
 def _get_pipeline():
@@ -74,8 +87,9 @@ def _result_to_markdown(res):
 
 def ocr_image(path):
     """Chạy OCR một ảnh, trả về chuỗi Markdown. Ném RuntimeError kèm hướng dẫn nếu chưa cài."""
-    if not ocr_available():
-        raise RuntimeError(INSTALL_HINT)
+    ok, why = ocr_status()
+    if not ok:
+        raise RuntimeError(why)
     with _lock:   # model chiếm nhiều VRAM: mỗi lúc chỉ xử lý một ảnh
         output = _get_pipeline().predict(path)
     return "\n\n".join(_result_to_markdown(r) for r in output)

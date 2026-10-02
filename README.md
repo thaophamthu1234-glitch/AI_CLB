@@ -29,6 +29,13 @@ python app.py
 2. `pip install -r requirements-ocr.txt`
 3. Vào *Thời khóa biểu → Nhập bằng ảnh chụp*. Lần đọc đầu tiên sẽ tải model nên chậm.
 
+**Đã cài PaddleOCR-VL ở môi trường Python khác** (vd môi trường của dự án khác) thì app không thấy được, vì `run.bat` chạy bằng `.venv` riêng của app. Có hai cách:
+
+- Chạy app bằng Python đã có PaddleOCR: tạo file `python.txt` cạnh `run.bat`, chỉ ghi đường dẫn tới `python.exe` đó (vd `C:\Users\PC\Documents\Du_an_khac\.venv\Scripts\python.exe`, không có dấu ngoặc kép). Lần chạy sau `run.bat` sẽ tự cài thêm Flask và qrcode vào môi trường đó.
+- Hoặc cài PaddleOCR vào `.venv` của app: `uv pip install --python .venv\Scripts\python.exe -r requirements-ocr.txt` (cần cài PaddlePaddle bản GPU vào cùng môi trường).
+
+Trang *Thời khóa biểu* ghi rõ app đang chạy bằng Python nào và vì sao chưa dùng được OCR.
+
 Nếu đã chạy sẵn PaddleOCR-VL qua vLLM, đặt `SACH_CHUNG_OCR_BACKEND=vllm-server` và `SACH_CHUNG_OCR_SERVER=http://127.0.0.1:8118/v1`.
 Không cài OCR thì app vẫn chạy bình thường, thời khóa biểu nhập bằng CSV.
 
