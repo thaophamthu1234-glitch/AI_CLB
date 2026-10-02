@@ -1,0 +1,3 @@
+# Tùy chọn: chỉ cần khi muốn nhập thời khóa biểu bằng ảnh (PaddleOCR-VL).
+# Cài PaddlePaddle trước (bản GPU nếu có card NVIDIA) theo hướng dẫn tại https://www.paddleocr.ai
+paddleocr[doc-parser]>=3.3

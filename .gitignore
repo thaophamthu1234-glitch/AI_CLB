@@ -1,0 +1,7 @@
+sach_chung.db
+*.bak
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/ocr/

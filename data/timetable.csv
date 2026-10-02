@@ -1,0 +1,33 @@
+class_name,weekday,period,subject
+6A1,2,1,Toán
+6A1,2,2,Ngữ văn
+6A1,2,3,Khoa học tự nhiên
+6A1,2,4,Ngữ văn
+6A2,2,1,Ngữ văn
+6A2,2,2,Toán
+6A2,2,3,Toán
+6A2,2,4,Khoa học tự nhiên
+6A1,3,1,Ngữ văn
+6A1,3,2,Toán
+6A1,3,3,Toán
+6A2,3,1,Toán
+6A2,3,2,Ngữ văn
+6A2,3,3,Khoa học tự nhiên
+6A1,4,1,Toán
+6A1,4,2,Khoa học tự nhiên
+6A1,4,3,Ngữ văn
+6A2,4,1,Khoa học tự nhiên
+6A2,4,2,Toán
+6A2,4,3,Ngữ văn
+6A1,5,1,Ngữ văn
+6A1,5,2,Ngữ văn
+6A1,5,3,Toán
+6A2,5,1,Toán
+6A2,5,2,Khoa học tự nhiên
+6A2,5,3,Toán
+6A1,6,1,Khoa học tự nhiên
+6A1,6,2,Toán
+6A1,6,3,Ngữ văn
+6A2,6,1,Ngữ văn
+6A2,6,2,Toán
+6A2,6,3,Ngữ văn
