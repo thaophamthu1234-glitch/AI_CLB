@@ -20,6 +20,8 @@ from collections import Counter
 from datetime import datetime, timedelta
 from functools import wraps
 
+from markupsafe import Markup, escape
+
 import qrcode
 import timetable_ocr
 from flask import (Flask, Response, abort, flash, g, redirect, render_template_string,
@@ -33,6 +35,8 @@ LOAN_DAYS = 1                    # mượn về nhà qua đêm, trả sáng hôm
 EBOOK_HOME = "https://taphuan.nxbgd.vn"   # SGK điện tử miễn phí chính thức của NXB Giáo dục VN
 SHARE_PER_BOOK = 2              # trên lớp: 2 học sinh ngồi cùng bàn dùng chung 1 cuốn
 EDITION_SUGGESTIONS = ["Kết nối tri thức với cuộc sống", "Chân trời sáng tạo", "Cánh diều"]
+PERIOD_MINUTES = 45
+DEFAULT_PERIOD_TIMES = "07:00,07:50,08:40,09:35,10:25,13:00,13:50,14:40,15:35,16:25"   # giờ bắt đầu tiết 1..10
 WEEKDAYS = {2: "Thứ 2", 3: "Thứ 3", 4: "Thứ 4", 5: "Thứ 5", 6: "Thứ 6", 7: "Thứ 7"}
 
 app = Flask(__name__)
@@ -188,6 +192,24 @@ def import_timetable(db, rows):
     return n
 
 
+REQUIRED_COLS = {
+    "students": ("name", "class_name"),
+    "books": ("subject", "grade"),
+    "lessons": ("grade", "subject", "week", "title"),
+    "timetable": ("class_name", "weekday", "period", "subject"),
+}
+
+
+def check_columns(rows, kind):
+    """File CSV thiếu cột bắt buộc → báo rõ thiếu cột nào thay vì lặng lẽ nhập 0 dòng."""
+    if not rows:
+        raise ValueError("file trống")
+    missing = [c for c in REQUIRED_COLS[kind] if c not in rows[0]]
+    if missing:
+        raise ValueError("thiếu cột " + ", ".join(missing))
+    return rows
+
+
 def get_setting(db, key, default=""):
     row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     return row[0] if row and row[0] is not None else default
@@ -297,7 +319,8 @@ def init_db(seed=True):
     db = sqlite3.connect(DB_PATH)
     db.executescript(SCHEMA)
     migrate(db)
-    if seed:
+    # Sau khi giáo viên bấm "Xóa dữ liệu mẫu" thì không tự nạp lại nữa
+    if seed and db.execute("SELECT 1 FROM settings WHERE key = 'no_seed' AND value = '1'").fetchone() is None:
         # Bảng nào còn trống thì nạp dữ liệu mẫu (kể cả khi DB đã được tạo từ lần chạy trước)
         for table, name, fn in (("students", "students.csv", import_students),
                                 ("books", "books.csv", import_books),
@@ -312,6 +335,7 @@ def init_db(seed=True):
             else:
                 rows = list(csv.DictReader(io.StringIO(SAMPLE_CSV[name])))
             print(f"  Nạp dữ liệu mẫu {name}: {fn(db, rows)} dòng")
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('sample_loaded', '1')")
     db.commit()
     db.close()
 
@@ -319,6 +343,21 @@ def init_db(seed=True):
 # ============================================================
 # Đăng nhập giáo viên (PIN đơn giản – học sinh quét QR chỉ xem được, không mượn/trả được)
 # ============================================================
+def safe_next():
+    """Đường dẫn quay về (chỉ chấp nhận đường dẫn nội bộ)."""
+    v = request.values.get("next") or ""
+    return v if v.startswith("/") and not v.startswith("//") else None
+
+
+def clock():
+    """Giờ hiện tại – tách ra hàm riêng để kiểm thử giả lập được giờ."""
+    return datetime.now()
+
+
+def program_closed(db):
+    return get_setting(db, "program_closed") == "1"
+
+
 def teacher_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
@@ -334,7 +373,7 @@ def login():
         if request.form.get("pin") == TEACHER_PIN:
             session["teacher"] = True
             session.permanent = True
-            return redirect(request.args.get("next") or url_for("dashboard"))
+            return redirect(safe_next() or url_for("today"))
         flash("Sai mã PIN", "error")
     return page("""
       <h1>Đăng nhập giáo viên</h1>
@@ -347,7 +386,7 @@ def login():
 @app.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for("dashboard"))
+    return redirect(url_for("lessons"))
 
 
 # ============================================================
@@ -566,25 +605,34 @@ ICONS = {
     "rotate": '<path d="M5 9a7.5 7.5 0 0 1 13.5-2.5L20 8"/><path d="M20 4v4h-4"/><path d="M19 15a7.5 7.5 0 0 1-13.5 2.5L4 16"/><path d="M4 20v-4h4"/>',
     "qr": '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M14 14h2v2h-2zM18 18h2v2h-2zM14 18h2M18 14h2"/>',
     "upload": '<path d="M12 15V4M7.5 8.5L12 4l4.5 4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
+    "scan": '<path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3M4 12h16"/>',
     "settings": '<circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/>',
     "logout": '<path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l-4-4 4-4M6 12h10"/>',
     "login": '<rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>',
 }
 
-# (endpoint, nhãn, icon, chỉ giáo viên, các endpoint khác cũng tính là "đang ở tab này")
+# Thanh điều hướng của giáo viên: 2 trang dùng hằng ngày + 2 menu
+# (endpoint, nhãn, icon, các endpoint khác cũng tính là "đang ở tab này")
 MAIN_NAV = [
-    ("dashboard", "Tổng quan", "home", False, ()),
-    ("lessons", "Bài tuần này", "lesson", False, ("lessons_print",)),
-    ("books", "Sách", "books", True, ("book_page",)),
-    ("students", "Học sinh", "students", True, ()),
-    ("loans", "Đang mượn", "loans", True, ()),
-    ("timetable_page", "Thời khóa biểu", "timetable", True, ()),
-    ("schedule", "Lịch chuyển sách", "rotate", True, ()),
+    ("today", "Hôm nay", "home", ("setup", "finish")),
+    ("scan", "Quét sách", "scan", ("book_page",)),
 ]
-TOOL_NAV = [
-    ("labels", "In nhãn QR", "qr"),
-    ("import_page", "Nhập CSV", "upload"),
-    ("settings_page", "Cài đặt", "settings"),
+MENUS = [
+    ("Quản lý", "books", [
+        ("students", "Học sinh", "students"),
+        ("books", "Kho sách", "books"),
+        ("timetable_page", "Thời khóa biểu", "timetable"),
+        ("schedule", "Lịch chuyển sách", "rotate"),
+        ("labels", "In nhãn QR", "qr"),
+        ("import_page", "Nhập dữ liệu (CSV)", "upload"),
+        ("lessons", "Bài tuần này", "lesson"),
+        ("settings_page", "Cài đặt", "settings"),
+    ]),
+    ("Báo cáo", "loans", [
+        ("dashboard", "Tổng quan", "home"),
+        ("loans", "Đang mượn", "loans"),
+        ("export_loans", "Tải nhật ký mượn (CSV)", "upload"),
+    ]),
 ]
 
 LAYOUT = """<!doctype html>
@@ -635,6 +683,41 @@ a{color:var(--accent)}
 .tab.on{background:var(--hl);color:var(--hl-ink);border-color:var(--hl);box-shadow:0 3px 0 #C9A800}
 .ico{width:19px;height:19px;flex:none;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
 .tool .ico{width:17px;height:17px}
+.menu{position:relative;flex:none}
+.menu>summary{list-style:none;cursor:pointer}
+.menu>summary::-webkit-details-marker{display:none}
+.menu>summary .caret{width:14px;height:14px;margin-left:-2px;transition:transform .15s}
+.menu[open]>summary .caret{transform:rotate(180deg)}
+.menu-panel{position:absolute;z-index:20;top:calc(100% + 6px);left:0;min-width:240px;padding:6px;background:var(--card);
+     border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 32px rgba(15,20,60,.22)}
+.menu-panel a{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;color:var(--ink);text-decoration:none;font-weight:500}
+.menu-panel a:hover{background:var(--bg)}
+.menu-panel a.on{background:var(--hl);color:var(--hl-ink)}
+.menu-panel .ico{color:var(--muted)} .menu-panel a.on .ico{color:var(--hl-ink)}
+/* Dấu "?" giải thích khái niệm */
+.tip{display:inline-block;position:relative;vertical-align:middle;margin-left:4px}
+.tip>summary{list-style:none;cursor:pointer;width:20px;height:20px;border-radius:50%;display:grid;place-items:center;
+     font-size:12px;font-weight:800;color:var(--accent);border:1.5px solid currentColor;line-height:1}
+.tip>summary::-webkit-details-marker{display:none}
+.tip .tip-body{position:absolute;z-index:15;left:-8px;top:26px;width:min(280px,80vw);padding:10px 12px;border-radius:10px;
+     background:var(--ink);color:var(--card);font-size:13.5px;font-weight:400;line-height:1.45;text-transform:none;letter-spacing:0}
+/* Trang Hôm nay */
+.when{display:flex;align-items:baseline;gap:10px;margin:30px 0 12px}
+.when h2{margin:0}
+.now{display:inline-block;white-space:nowrap;padding:2px 10px;border-radius:99px;background:var(--hl);color:var(--hl-ink);font-size:13px;font-weight:700}
+.section-now{border-color:var(--accent);box-shadow:inset 4px 0 0 var(--accent)}
+.empty{padding:22px;text-align:left;border-style:dashed;background:transparent}
+.empty p{margin:0 0 12px}
+.steps{display:flex;gap:6px;margin:0 0 20px;flex-wrap:wrap}
+.steps a{flex:1;min-width:120px;display:flex;gap:8px;align-items:center;padding:10px 12px;border-radius:10px;border:1.5px solid var(--line);
+     color:var(--muted);text-decoration:none;font-size:14px;font-weight:600;background:var(--card)}
+.steps a b{display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:var(--line);color:var(--ink);flex:none}
+.steps a.done b{background:var(--ok);color:#fff} .steps a.on{border-color:var(--accent);color:var(--ink)}
+.steps a.on b{background:var(--accent);color:var(--accent-ink)}
+.fab{display:none}
+@media (max-width:640px){.fab{display:flex;position:fixed;z-index:30;left:16px;right:16px;bottom:16px;justify-content:center;gap:10px;
+     padding:16px;border-radius:14px;background:var(--hl);color:var(--hl-ink);font-weight:800;font-size:18px;text-decoration:none;
+     box-shadow:0 6px 0 #C9A800,0 10px 24px rgba(0,0,0,.25)} main.has-fab{padding-bottom:110px}}
 
 /* ---- Nội dung ---- */
 main{max-width:1080px;margin:0 auto;padding:28px 16px 56px}
@@ -658,7 +741,7 @@ label{display:block;margin-bottom:10px;font-size:14px;font-weight:500;color:var(
 input,select,textarea{display:block;width:100%;margin-top:5px;padding:10px 12px;font:inherit;color:var(--ink);
       background:var(--bg);border:1.5px solid var(--line);border-radius:10px}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);background:var(--card)}
-input[type=checkbox]{display:inline;width:auto;margin:0 6px 0 0;accent-color:var(--accent)}
+input[type=checkbox],input[type=radio]{display:inline-block;width:auto;margin:0 8px 0 0;padding:0;vertical-align:middle;accent-color:var(--accent)}
 button,.btn{display:inline-block;padding:10px 18px;font:inherit;font-weight:700;border:1.5px solid var(--accent);border-radius:10px;
       background:var(--accent);color:var(--accent-ink);cursor:pointer;text-decoration:none}
 button:hover,.btn:hover{filter:brightness(1.1)}
@@ -683,7 +766,8 @@ button[disabled]{opacity:.45;cursor:not-allowed}
 .sheet .lesson{break-inside:avoid;border-top:1px solid #ccc;padding-top:6px;display:flex;gap:12px}
 .sheet .lesson>div{flex:1} .sheet .lesson img{width:84px;height:84px}
 .sheet .foot{font-size:12px;color:#444;margin-top:18px;border-top:1px solid #ccc;padding-top:6px}
-@media (max-width:640px){.bar{flex-wrap:wrap}.tools{width:100%;justify-content:flex-start}.tool span{display:none}
+@media (max-width:640px){.menu-panel{position:fixed;left:12px;right:12px;top:auto;min-width:0}
+      .tool span{display:none}
       .tool{padding:8px}h1{font-size:24px}}
 @media print{.top,.noprint{display:none!important} body{background:#fff} main{padding:0;max-width:none}
       .label{border-color:#999} .sheet{border:0;padding:0;max-width:none}}
@@ -691,13 +775,10 @@ button[disabled]{opacity:.45;cursor:not-allowed}
 {% macro icon(name) %}<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">{{ icons[name]|safe }}</svg>{% endmacro %}
 <header class="top"><div class="top-in">
   <div class="bar">
-    <a class="brand" href="{{ url_for('dashboard') }}">{{ logo|safe }}
+    <a class="brand" href="{{ url_for('index') }}">{{ logo|safe }}
       <span><b>Sách Chung</b><small>Mượn sách giáo khoa luân phiên</small></span></a>
-    <nav class="tools" aria-label="Công cụ">
+    <nav class="tools" aria-label="Tài khoản">
       {% if session.teacher %}
-        {% for ep, text, ic in tool_nav %}
-        <a class="tool {{ 'on' if request.endpoint == ep }}" href="{{ url_for(ep) }}" title="{{ text }}">{{ icon(ic) }}<span>{{ text }}</span></a>
-        {% endfor %}
         <a class="tool" href="{{ url_for('logout') }}" title="Đăng xuất">{{ icon('logout') }}<span>Đăng xuất</span></a>
       {% else %}
         <a class="tool cta {{ 'on' if request.endpoint == 'login' }}" href="{{ url_for('login') }}">{{ icon('login') }}<span>Giáo viên đăng nhập</span></a>
@@ -705,32 +786,75 @@ button[disabled]{opacity:.45;cursor:not-allowed}
     </nav>
   </div>
   <nav class="tabs" aria-label="Trang chính">
-    {% for ep, text, ic, teacher_only, also in main_nav if session.teacher or not teacher_only %}
-    {% set on = request.endpoint == ep or request.endpoint in also %}
-    <a class="tab {{ 'on' if on }}" href="{{ url_for(ep) }}" {{ 'aria-current=page' if on }}>{{ icon(ic) }}{{ text }}</a>
-    {% endfor %}
+    {% if session.teacher %}
+      {% for ep, text, ic, also in main_nav %}
+      {% set on = request.endpoint == ep or request.endpoint in also %}
+      <a class="tab {{ 'on' if on }}" href="{{ url_for(ep) }}" {{ 'aria-current=page' if on }}>{{ icon(ic) }}{{ text }}</a>
+      {% endfor %}
+      {% for title, ic, items in menus %}
+      {% set on = request.endpoint in items|map(attribute=0)|list %}
+      <details class="menu">
+        <summary class="tab {{ 'on' if on }}">{{ icon(ic) }}{{ title }}<svg class="ico caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></summary>
+        <div class="menu-panel">
+          {% for ep, text, ic2 in items %}
+          <a class="{{ 'on' if request.endpoint == ep }}" href="{{ url_for(ep) }}">{{ icon(ic2) }}{{ text }}</a>
+          {% endfor %}
+        </div>
+      </details>
+      {% endfor %}
+    {% else %}
+      <a class="tab {{ 'on' if request.endpoint in ('lessons', 'lessons_print', 'index') }}" href="{{ url_for('lessons') }}">{{ icon('lesson') }}Bài tuần này</a>
+    {% endif %}
   </nav>
 </div></header>
-<main>
+<main class="{{ 'has-fab' if session.teacher and request.endpoint == 'today' }}">
 {% with msgs = get_flashed_messages(with_categories=true) %}
   {% for cat, m in msgs %}<div class="flash {{ cat }}">{{ m }}</div>{% endfor %}
 {% endwith %}
 {{ body|safe }}
 </main>
-<script>var t=document.querySelector('.tab.on');if(t&&t.scrollIntoView)t.scrollIntoView({block:'nearest',inline:'center'});</script>
+{% if session.teacher and request.endpoint == 'today' %}<a class="fab" href="{{ url_for('scan') }}">{{ icon('scan') }}Quét sách</a>{% endif %}
+<script>
+var t=document.querySelector('.tab.on');if(t&&t.scrollIntoView)t.scrollIntoView({block:'nearest',inline:'center'});
+// Đóng menu/giải thích khi bấm ra ngoài hoặc nhấn Esc
+function closeAll(e){document.querySelectorAll('details.menu[open],details.tip[open]').forEach(function(d){if(!e||!d.contains(e.target))d.removeAttribute('open')})}
+document.addEventListener('click',closeAll);document.addEventListener('keydown',function(e){if(e.key==='Escape')closeAll()});
+</script>
 </body></html>"""
 
 
+def tip(text):
+    """Dấu "?" nhỏ cạnh một khái niệm mới; bấm vào hiện giải thích một câu."""
+    return Markup('<details class="tip"><summary aria-label="Giải thích">?</summary><span class="tip-body">%s</span></details>') % escape(text)
+
+
+TIPS = {
+    "reference": "Sách khác bộ sách trường đang dạy (vd sách bộ cũ phụ huynh tặng). Vẫn cho mượn được để tham khảo, "
+                 "nhưng hệ thống không tự gợi ý và không đưa vào lịch xoay vòng.",
+    "rotation": "Một bộ sách được chuyển giữa các lớp theo thời khóa biểu: lớp nào đang học môn đó thì dùng, "
+                "nhờ vậy cùng số sách nhưng nhiều học sinh có sách hơn.",
+    "unreached": "Học sinh chưa có sách chính thức, không có thiết bị đọc SGK điện tử và chưa lần nào được mượn sách về nhà. "
+                 "Đây là những em cần ưu tiên nhất.",
+    "overdue": "Sách mượn về nhà phải trả trước 7:30 sáng hôm sau. Quá giờ đó mà chưa trả thì tính là quá hạn.",
+}
+
+
 def page(body_tpl, **ctx):
-    body = render_template_string(body_tpl, **ctx)
+    body = render_template_string(body_tpl, tip=tip, tips=TIPS, **ctx)
     return render_template_string(LAYOUT, body=body, logo=LOGO_SVG.format(size=44), favicon=FAVICON,
-                                  icons=ICONS, main_nav=MAIN_NAV, tool_nav=TOOL_NAV)
+                                  icons=ICONS, main_nav=MAIN_NAV, menus=MENUS)
 
 
 # ============================================================
 # Trang tổng quan
 # ============================================================
 @app.route("/")
+def index():
+    return redirect(url_for("today") if session.get("teacher") else url_for("lessons"))
+
+
+@app.route("/overview")
+@teacher_required
 def dashboard():
     db = get_db()
     st = stats(db)
@@ -752,8 +876,7 @@ def dashboard():
       <h1>Tổng quan</h1>
       {% if st.total and st.pct_own == 100 %}
         <div class="card" style="background:var(--ok-bg)"><b>🎉 Tất cả học sinh đã có sách chính thức.</b>
-          Chương trình chuyển tiếp có thể kết thúc: thu hồi sách mượn về thư viện và
-          <a href="{{ url_for('export_loans') }}">tải nhật ký mượn (CSV)</a> để lưu.</div>
+          Chương trình chuyển tiếp có thể kết thúc. <a href="{{ url_for('finish') }}">Kết thúc chương trình</a></div>
       {% endif %}
       <div class="card">
         <div class="row" style="align-items:center">
@@ -765,11 +888,11 @@ def dashboard():
       <div class="grid">
         <div class="stat"><b>{{ st.need }}</b><span>học sinh đang chờ sách</span></div>
         <div class="stat"><b>{{ st.no_device }}</b><span>trong số đó không có thiết bị đọc SGK điện tử</span></div>
-        <div class="stat {% if st.unreached %}warn{% endif %}"><b>{{ st.unreached }}</b><span>chưa từng được mượn sách về nhà</span></div>
+        <div class="stat {% if st.unreached %}warn{% endif %}"><b>{{ st.unreached }}</b><span>chưa từng được mượn sách về nhà {{ tip(tips.unreached) }}</span></div>
         <div class="stat"><b>{{ st.matching }}</b><span>cuốn đúng bộ sách trường dạy</span></div>
-        {% if st.reference %}<div class="stat"><b>{{ st.reference }}</b><span>cuốn khác bộ (chỉ tham khảo)</span></div>{% endif %}
+        {% if st.reference %}<div class="stat"><b>{{ st.reference }}</b><span>cuốn khác bộ (chỉ tham khảo) {{ tip(tips.reference) }}</span></div>{% endif %}
         <div class="stat"><b>{{ st.out }}</b><span>đang được mượn</span></div>
-        <div class="stat {% if st.overdue %}warn{% endif %}"><b>{{ st.overdue }}</b><span>quá hạn trả</span></div>
+        <div class="stat {% if st.overdue %}warn{% endif %}"><b>{{ st.overdue }}</b><span>quá hạn trả {{ tip(tips.overdue) }}</span></div>
       </div>
 
       <h2>Theo lớp</h2>
@@ -778,7 +901,7 @@ def dashboard():
         {% for c in per_class %}
         <tr><td><b>{{ c.class_name }}</b></td><td>{{ c.total }}</td><td>{{ c.own }}</td>
             <td>{{ c.no_device }}</td><td>{{ c.books }}</td><td>{{ c.out }}</td></tr>
-        {% else %}<tr><td colspan="6" class="muted">Chưa có dữ liệu học sinh.</td></tr>{% endfor %}
+        {% else %}<tr><td colspan="6" class="muted">Chưa có học sinh. <a href="{{ url_for('setup', step=2) }}">Nhập danh sách học sinh</a></td></tr>{% endfor %}
       </table></div>
 
       <h2>Kho sách theo môn</h2>
@@ -786,7 +909,7 @@ def dashboard():
         <tr><th>Môn</th><th>Khối</th><th>Tổng</th><th>Đang mượn</th><th>Sẵn sàng</th></tr>
         {% for b in by_subject %}
         <tr><td>{{ b.subject }}</td><td>{{ b.grade }}</td><td>{{ b.n }}</td><td>{{ b.out }}</td><td>{{ b.n - b.out }}</td></tr>
-        {% else %}<tr><td colspan="5" class="muted">Chưa có sách.</td></tr>{% endfor %}
+        {% else %}<tr><td colspan="5" class="muted">Kho chưa có sách. <a href="{{ url_for('setup', step=3) }}">Nhập sách vào kho</a></td></tr>{% endfor %}
       </table></div>
 
       <h2>Đọc SGK điện tử miễn phí</h2>
@@ -824,7 +947,7 @@ def book_page(book_id):
           <div><span class="muted small">Tình trạng</span><br><b>{{ b.condition }}</b></div>
           <div><span class="muted small">Nguồn</span><br><b>{{ b.source }}</b></div>
           <div><span class="muted small">Bộ sách</span><br><b>{{ b.edition or edition or '—' }}</b>
-            {% if reference %}<br><span class="pill warn">Tham khảo · khác bộ trường dạy</span>{% endif %}</div>
+            {% if reference %}<br><span class="pill warn">Tham khảo · khác bộ trường dạy</span> {{ tip(tips.reference) }}{% endif %}</div>
           <div><span class="muted small">Trạng thái</span><br>
             {% if loan %}<span class="pill {{ 'warn' if overdue else '' }}">Đang mượn{{ ' · QUÁ HẠN' if overdue }}</span>
             {% else %}<span class="pill ok">Sẵn sàng</span>{% endif %}</div>
@@ -842,7 +965,7 @@ def book_page(book_id):
                 {% for c in ['Tốt','Hơi cũ','Rách/hư cần sửa','Mất'] %}
                 <option {{ 'selected' if c == b.condition }}>{{ c }}</option>{% endfor %}
               </select></label>
-            <button class="big">✅ Xác nhận đã trả</button>
+            <button class="big">Đã trả</button>
           </form>
           {% endif %}
         </div>
@@ -893,6 +1016,9 @@ def book_page(book_id):
 @teacher_required
 def borrow(book_id):
     db = get_db()
+    if program_closed(db):
+        flash("Chương trình đã kết thúc nên không cho mượn thêm. Mở lại trong Báo cáo → Tổng quan nếu cần.", "error")
+        return redirect(safe_next() or url_for("book_page", book_id=book_id))
     if active_loan(db, book_id):
         flash("Sách này đang được mượn, cần trả trước.", "error")
         return redirect(url_for("book_page", book_id=book_id))
@@ -904,8 +1030,8 @@ def borrow(book_id):
     db.execute("INSERT INTO loans(book_id, student_id, out_at, due_at) VALUES (?,?,?,?)",
                (book_id, student_id, now(), due))
     db.commit()
-    flash(f"Đã cho {st['name']} mượn. Hạn trả: {due}.")
-    return redirect(url_for("book_page", book_id=book_id))
+    flash(f"Đã cho mượn: {st['name']} giữ cuốn #{book_id}, hạn trả {due}.")
+    return redirect(safe_next() or url_for("book_page", book_id=book_id))
 
 
 @app.post("/b/<int:book_id>/return")
@@ -919,8 +1045,8 @@ def return_book(book_id):
         if cond:
             db.execute("UPDATE books SET condition = ? WHERE id = ?", (cond, book_id))
         db.commit()
-        flash(f"{loan['name']} đã trả sách.")
-    return redirect(url_for("book_page", book_id=book_id))
+        flash(f"Đã trả: {loan['name']} trả cuốn #{book_id}.")
+    return redirect(safe_next() or url_for("book_page", book_id=book_id))
 
 
 # ============================================================
@@ -959,7 +1085,7 @@ def books():
         </div>
       </form>
       <div class="scroll"><table>
-        <tr><th>#</th><th>Môn</th><th>Khối</th><th>Lớp</th><th>Bộ sách</th><th>Tình trạng</th><th>Đang ở</th></tr>
+        <tr><th>#</th><th>Môn</th><th>Khối</th><th>Lớp</th><th>Bộ sách {{ tip(tips.reference) }}</th><th>Tình trạng</th><th>Đang ở</th></tr>
         {% for b in rows %}
         <tr><td><a href="{{ url_for('book_page', book_id=b.id) }}">{{ b.id }}</a></td><td>{{ b.subject }}</td>
           <td>{{ b.grade }}</td><td>{{ b.class_name or '—' }}</td>
@@ -968,6 +1094,8 @@ def books():
           <td>{% if b.borrower %}{{ b.borrower }}
               {% if b.due_at < now %}<span class="pill warn">quá hạn</span>{% endif %}
               {% else %}<span class="pill ok">Sẵn sàng</span>{% endif %}</td></tr>
+        {% else %}<tr><td colspan="7" class="muted">Kho chưa có sách. Thêm ở form phía trên, hoặc
+          <a href="{{ url_for('import_page') }}">nhập cả danh sách từ file CSV</a>.</td></tr>
         {% endfor %}
       </table></div>
       <datalist id="editions">{% for e in editions %}<option value="{{ e }}">{% endfor %}</datalist>""",
@@ -1024,6 +1152,8 @@ def students():
             <button class="btn ghost" style="padding:2px 10px">{{ '✔ Có' if val else '✘ Chưa' }}</button>
           </form></td>{% endfor %}
           <td>{{ s.holding or '—' }}</td><td>{{ s.times }}</td></tr>
+        {% else %}<tr><td colspan="6" class="muted">Chưa có học sinh. Thêm ở form phía trên, hoặc
+          <a href="{{ url_for('import_page') }}">nhập cả lớp từ file CSV</a>.</td></tr>
         {% endfor %}
       </table></div>""", rows=rows, classes=classes)
 
@@ -1038,12 +1168,14 @@ def loans():
       <h1>Sách đang được mượn</h1>
       <p><a class="btn ghost" href="{{ url_for('export_loans') }}">Tải toàn bộ nhật ký mượn (CSV)</a></p>
       <div class="scroll"><table>
-        <tr><th>Sách</th><th>Học sinh</th><th>Mượn lúc</th><th>Hạn trả</th></tr>
+        <tr><th>Sách</th><th>Học sinh</th><th>Mượn lúc</th><th>Hạn trả {{ tip(tips.overdue) }}</th></tr>
         {% for l in rows %}
         <tr><td><a href="{{ url_for('book_page', book_id=l.book_id) }}">#{{ l.book_id }} {{ l.subject }} {{ l.grade }}</a></td>
           <td>{{ l.name }} <span class="muted small">{{ l.class_name }}</span></td><td>{{ l.out_at }}</td>
           <td>{{ l.due_at }} {% if l.due_at < now %}<span class="pill warn">quá hạn</span>{% endif %}</td></tr>
-        {% else %}<tr><td colspan="4" class="muted">Không có sách nào đang được mượn.</td></tr>{% endfor %}
+        {% else %}<tr><td colspan="4" class="muted">Không có sách nào đang được mượn. Cho mượn bằng cách
+          <a href="{{ url_for('scan') }}">quét mã QR trên sách</a> hoặc ở mục cuối giờ của trang
+          <a href="{{ url_for('today') }}">Hôm nay</a>.</td></tr>{% endfor %}
       </table></div>""", rows=rows, now=now())
 
 
@@ -1094,7 +1226,8 @@ def labels():
         <div class="label"><img src="{{ it.qr }}" alt="QR sách {{ it.b.id }}">
           <b>{{ it.b.subject }} {{ it.b.grade }} · #{{ it.b.id }}</b>
           <span>Sách Chung · lớp {{ it.b.class_name or '—' }}</span></div>
-        {% else %}<p class="muted">Chưa có sách.</p>{% endfor %}
+        {% else %}<div class="card empty"><p>Chưa có sách nào để in nhãn.</p>
+          <a class="btn" href="{{ url_for('setup', step=3) }}">Nhập sách vào kho</a></div>{% endfor %}
       </div>""", items=items, base=base, warn_local=warn_local, suggested=suggested, cls=cls)
 
 
@@ -1137,7 +1270,10 @@ def lessons():
           {% if l.worksheet_url %}<a class="btn ghost" href="{{ l.worksheet_url }}" target="_blank" rel="noopener">📝 Phiếu học tập</a>{% endif %}
         </div>
       </div>
-      {% else %}<p class="muted">Chưa có bài học nào.</p>{% endfor %}
+      {% else %}<div class="card empty"><p>{% if session.teacher %}Chưa có bài học nào. Thêm bài đầu tiên ở form bên dưới
+        để học sinh biết tuần này học gì.{% else %}Thầy cô chưa đăng bài cho tuần này. Trong lúc chờ, em có thể đọc
+        SGK điện tử miễn phí.{% endif %}</p>
+        <a class="btn ghost" href="{{ ebook }}" target="_blank" rel="noopener">Mở SGK điện tử</a></div>{% endfor %}
       <p class="small muted">SGK điện tử do NXB Giáo dục Việt Nam cung cấp miễn phí. Phiếu học tập do giáo viên tự biên soạn.</p>
 
       {% if session.teacher %}
@@ -1175,11 +1311,11 @@ def import_page():
         else:
             try:
                 db = get_db()
-                n = fn(db, read_csv_rows(f))
+                n = fn(db, check_columns(read_csv_rows(f), kind))
                 db.commit()
                 flash(f"Đã nhập {n} dòng.")
             except (KeyError, ValueError) as e:
-                flash(f"File CSV sai định dạng (thiếu/sai cột {e}). Xem file mẫu trong thư mục data/.", "error")
+                flash(f"File CSV sai định dạng ({e}). Xem file mẫu trong thư mục data/.", "error")
         return redirect(url_for("import_page"))
     return page("""
       <h1>Nhập dữ liệu từ CSV</h1>
@@ -1207,6 +1343,13 @@ def settings_page():
     db = get_db()
     if request.method == "POST":
         set_setting(db, "edition", (request.form.get("edition") or "").strip())
+        set_setting(db, "edition_set", "1")
+        times = [t.strip() for t in (request.form.get("period_times") or "").split(",") if t.strip()]
+        if times:
+            if not all(re.fullmatch(r"\d{1,2}:\d{2}", t) for t in times):
+                flash("Giờ bắt đầu các tiết phải có dạng 07:00, 07:50, … (cách nhau bằng dấu phẩy).", "error")
+                return redirect(url_for("settings_page"))
+            set_setting(db, "period_times", ",".join(t.zfill(5) for t in times))
         db.commit()
         flash("Đã lưu cài đặt.")
         return redirect(url_for("settings_page"))
@@ -1220,6 +1363,9 @@ def settings_page():
         <datalist id="editions">{% for e in editions %}<option value="{{ e }}">{% endfor %}</datalist>
         <p class="small muted" style="margin-top:0">Sách khác bộ này được đánh dấu <b>tham khảo</b>: không được gợi ý
           tự động và không đưa vào lịch xoay vòng. Để trống nếu chưa muốn phân biệt.</p>
+        <label>Giờ bắt đầu tiết 1, 2, 3… (dùng để trang Hôm nay biết đang ở tiết nào)
+          <input name="period_times" value="{{ period_times }}"></label>
+        <p class="small muted" style="margin-top:0">Mỗi tiết {{ minutes }} phút. Buổi chiều đánh số nối tiếp (tiết 6, 7…).</p>
         <button>Lưu</button>
       </form>
       <h2>Kho sách theo bộ</h2>
@@ -1227,7 +1373,8 @@ def settings_page():
         {% for r in by_ed %}<tr><td>{{ r.ed or '(không ghi – tính theo bộ trường dạy)' }}</td><td>{{ r.n }}</td>
           <td>{% if r.ed and edition and r.ed != edition %}<span class="pill warn">tham khảo</span>
               {% else %}<span class="pill ok">đúng bộ</span>{% endif %}</td></tr>{% endfor %}
-      </table></div>""", edition=edition, editions=EDITION_SUGGESTIONS, by_ed=by_ed)
+      </table></div>""", edition=edition, editions=EDITION_SUGGESTIONS, by_ed=by_ed,
+                period_times=get_setting(db, "period_times", DEFAULT_PERIOD_TIMES), minutes=PERIOD_MINUTES)
 
 
 # ============================================================
@@ -1245,7 +1392,7 @@ def schedule():
     plan = plan_day(db, weekday)
     n_tt = db.execute("SELECT COUNT(*) FROM timetable").fetchone()[0]
     return page("""
-      <h1>Lịch chuyển sách · {{ days[weekday] }}</h1>
+      <h1>Lịch chuyển sách · {{ days[weekday] }} {{ tip(tips.rotation) }}</h1>
       <p class="noprint">{% for d, name in days.items() %}<a class="btn {{ '' if d == weekday else 'ghost' }}"
          style="padding:4px 12px" href="{{ url_for('schedule', day=d) }}">{{ name }}</a> {% endfor %}
          &nbsp;<button onclick="window.print()" class="btn ghost" style="padding:4px 12px">🖨 In</button></p>
@@ -1348,6 +1495,7 @@ def timetable_page():
           <label>Lớp (để trống = tự đọc từ ảnh)<input name="class_name" placeholder="6A1"></label>
           <div><button {{ 'disabled' if not ocr_ok }}>Đọc ảnh</button></div>
         </div>
+        {% if request.args.next %}<input type="hidden" name="next" value="{{ request.args.next }}">{% endif %}
       </form>
       <p>Hoặc <a href="{{ url_for('import_page') }}">nhập file CSV</a> ·
         <a href="{{ url_for('timetable_export') }}">Tải toàn bộ TKB (CSV)</a></p>
@@ -1360,7 +1508,8 @@ def timetable_page():
           <button class="btn ghost" style="padding:4px 12px">Xóa TKB lớp {{ cls }}</button>
           <a class="btn ghost" style="padding:4px 12px" href="{{ url_for('timetable_export', cls=cls) }}">Tải CSV lớp {{ cls }}</a>
         </form>
-      {% else %}<p class="muted">Chưa có thời khóa biểu.</p>{% endif %}
+      {% else %}<div class="card empty"><p>Chưa có thời khóa biểu. Chụp ảnh TKB của từng lớp ở form phía trên để
+        hệ thống lập lịch chuyển sách giữa các lớp.</p></div>{% endif %}
     """, classes=classes, cls=cls, grid=grid, periods=periods, days=WEEKDAYS, editable=False,
                 ocr_ok=timetable_ocr.ocr_available(), hint=timetable_ocr.INSTALL_HINT)
 
@@ -1387,10 +1536,10 @@ def timetable_scan():
     cls, rows, warnings = timetable_ocr.parse_timetable(markdown, request.form.get("class_name"), known_subjects(db))
     mime = f.mimetype or "image/jpeg"
     return render_timetable_preview(cls, rows, warnings, markdown,
-                                    "data:%s;base64,%s" % (mime, base64.b64encode(data).decode()))
+                                    "data:%s;base64,%s" % (mime, base64.b64encode(data).decode()), safe_next())
 
 
-def render_timetable_preview(cls, rows, warnings, markdown="", image=None):
+def render_timetable_preview(cls, rows, warnings, markdown="", image=None, next_url=None):
     db = get_db()
     grid = timetable_grid(rows)
     periods = range(1, max(max(grid or [0]), 5) + 2)   # chừa thêm 1 hàng trống để bổ sung
@@ -1408,6 +1557,7 @@ def render_timetable_preview(cls, rows, warnings, markdown="", image=None):
         </div>
         """ + TT_GRID + """
         <datalist id="subjects">{% for s in subjects %}<option value="{{ s }}">{% endfor %}</datalist>
+        {% if next_url %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
         <p><button>💾 Lưu vào hệ thống và xuất CSV</button>
            <a class="btn ghost" href="{{ url_for('timetable_page') }}">Hủy</a></p>
       </form>
@@ -1417,7 +1567,7 @@ def render_timetable_preview(cls, rows, warnings, markdown="", image=None):
         <pre style="white-space:pre-wrap;font-size:12px">{{ markdown }}</pre></details>{% endif %}
     """, cls=cls, grid=grid, periods=periods, days=WEEKDAYS, editable=True, warnings=warnings,
                 n=len(rows), existing=existing, subjects=sorted(set(known_subjects(db))),
-                markdown=markdown, image=image)
+                markdown=markdown, image=image, next_url=next_url)
 
 
 @app.post("/timetable/save")
@@ -1446,7 +1596,7 @@ def timetable_save():
     with open(os.path.join(OCR_EXPORT_DIR, fname), "w", encoding="utf-8", newline="") as fh:
         fh.write(timetable_csv(rows))
     flash(f"Đã lưu {n} tiết cho lớp {cls}. File CSV: data/ocr/{fname}")
-    return redirect(url_for("timetable_page", cls=cls))
+    return redirect(safe_next() or url_for("timetable_page", cls=cls))
 
 
 @app.post("/timetable/delete")
@@ -1515,6 +1665,476 @@ def lessons_print():
         <div class="foot">Phiếu do giáo viên biên soạn, không sao chép nội dung sách giáo khoa.
           SGK điện tử miễn phí: {{ ebook }} · Sách Chung</div>
       </div>""", items=items, grade=grade, week=week, copies=copies, ebook=EBOOK_HOME)
+
+
+# ============================================================
+# Thiết lập ban đầu (5 bước) và các tiện ích dùng chung
+# ============================================================
+def sample_rows(name):
+    path = os.path.join(DATA_DIR, name)
+    if os.path.exists(path):
+        return read_csv_rows(path)
+    return list(csv.DictReader(io.StringIO(SAMPLE_CSV[name])))
+
+
+def setup_steps(db):
+    count = lambda t: db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+    n_st, n_bk, n_tt = count("students"), count("books"), count("timetable")
+    return [
+        dict(n=1, title="Chọn bộ sách", done=get_setting(db, "edition_set") == "1"),
+        dict(n=2, title="Nhập học sinh", done=n_st > 0, count=n_st),
+        dict(n=3, title="Nhập sách", done=n_bk > 0, count=n_bk),
+        dict(n=4, title="Thời khóa biểu", done=n_tt > 0, count=n_tt),
+        dict(n=5, title="In nhãn QR", done=get_setting(db, "qr_done") == "1"),
+    ]
+
+
+CSV_TEMPLATES = {
+    "students": ("hoc_sinh_mau.csv", "students.csv"),
+    "books": ("sach_mau.csv", "books.csv"),
+    "timetable": ("thoi_khoa_bieu_mau.csv", "timetable.csv"),
+    "lessons": ("bai_hoc_mau.csv", "lessons.csv"),
+}
+
+
+@app.route("/template/<kind>.csv")
+@teacher_required
+def csv_template(kind):
+    if kind not in CSV_TEMPLATES:
+        abort(404)
+    fname, src = CSV_TEMPLATES[kind]
+    rows = sample_rows(src)
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    w.writeheader()
+    w.writerows(rows)
+    return Response("﻿" + buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
+@app.route("/setup", methods=["GET", "POST"])
+@app.route("/setup/<int:step>", methods=["GET", "POST"])
+@teacher_required
+def setup(step=None):
+    db = get_db()
+    steps = setup_steps(db)
+    if step is None:
+        step = next((s["n"] for s in steps if not s["done"]), 5)
+    step = min(max(step, 1), 5)
+    if request.method == "POST":
+        action = request.form.get("action")
+        importers = {"students": import_students, "books": import_books, "timetable": import_timetable}
+        sample_files = {"students": "students.csv", "books": "books.csv", "timetable": "timetable.csv"}
+        kind = request.form.get("kind")
+        try:
+            if action == "edition":
+                choice = request.form.get("edition_choice")
+                ed = (request.form.get("edition_other") or "").strip() if choice == "__other" else (choice or "")
+                set_setting(db, "edition", ed)
+                set_setting(db, "edition_set", "1")
+                flash(f"Đã lưu bộ sách: {ed or 'chưa phân biệt bộ sách'}.")
+            elif action == "csv" and kind in importers:
+                f = request.files.get("file")
+                if not f or not f.filename:
+                    flash("Chọn file CSV trước khi bấm Nhập file.", "error")
+                    return redirect(url_for("setup", step=step))
+                flash(f"Đã nhập {importers[kind](db, check_columns(read_csv_rows(f), kind))} dòng.")
+            elif action == "sample" and kind in importers:
+                flash(f"Đã nạp {importers[kind](db, sample_rows(sample_files[kind]))} dòng dữ liệu mẫu.")
+            elif action == "manual" and kind == "students":
+                f = request.form
+                import_students(db, [{"name": f["name"], "class_name": f["class_name"],
+                                      "has_device": f.get("has_device", 0), "has_own_book": f.get("has_own_book", 0)}])
+                flash(f"Đã thêm học sinh {f['name']}.")
+            elif action == "manual" and kind == "books":
+                f = request.form
+                n = import_books(db, [{"subject": f["subject"], "grade": f["grade"], "class_name": f.get("class_name"),
+                                       "quantity": f.get("quantity") or 1, "source": f.get("source")}])
+                flash(f"Đã thêm {n} cuốn {f['subject']} {f['grade']}.")
+            elif action == "reset":
+                for t in ("loans", "students", "books", "timetable", "lessons"):
+                    db.execute(f"DELETE FROM {t}")
+                for k, v in (("no_seed", "1"), ("sample_loaded", "0"), ("qr_done", "0")):
+                    set_setting(db, k, v)
+                db.commit()
+                flash("Đã xóa dữ liệu mẫu. Bắt đầu nhập dữ liệu thật của trường.")
+                return redirect(url_for("setup", step=2))
+            elif action == "qr_done":
+                set_setting(db, "qr_done", "1")
+                db.commit()
+                flash("Thiết lập xong. Từ giờ mỗi ngày chỉ cần mở trang Hôm nay.")
+                return redirect(url_for("today"))
+        except (KeyError, ValueError) as e:
+            flash(f"File CSV sai định dạng ({e}). Tải file mẫu để xem đúng các cột.", "error")
+            return redirect(url_for("setup", step=step))
+        db.commit()
+        go = step + 1 if action in ("edition",) else step
+        return redirect(url_for("setup", step=go))
+
+    if get_setting(db, "setup_seen") != "1":
+        set_setting(db, "setup_seen", "1")
+        db.commit()
+    cur = steps[step - 1]
+    preview = []
+    if step == 5:
+        base = request.host_url.rstrip("/")
+        preview = [dict(b=b, qr=qr_data_uri(f"{base}/b/{b['id']}"))
+                   for b in db.execute("SELECT * FROM books ORDER BY id LIMIT 4")]
+    classes = db.execute("SELECT class_name, COUNT(*) AS n FROM students GROUP BY 1 ORDER BY 1").fetchall()
+    tt_classes = [r[0] for r in db.execute("SELECT DISTINCT class_name FROM timetable ORDER BY 1")]
+    return page("""
+      <h1>Thiết lập ban đầu</h1>
+      <p class="muted" style="margin-top:-8px">Làm một lần, khoảng 15 phút. Bước nào chưa sẵn sàng có thể bỏ qua và làm sau.</p>
+      {% if sample_loaded %}
+      <form method="post" class="card" style="background:var(--warn-bg);border-color:transparent"
+            onsubmit="return confirm('Xóa toàn bộ học sinh, sách, thời khóa biểu, bài học và lượt mượn hiện có?')">
+        <input type="hidden" name="action" value="reset">
+        <b>Hệ thống đang chứa dữ liệu mẫu</b> (học sinh và sách hư cấu) để bạn dùng thử.
+        Khi sẵn sàng nhập dữ liệu thật của trường: <button class="btn ghost" style="padding:4px 12px;margin-left:4px">Xóa dữ liệu mẫu</button>
+      </form>{% endif %}
+      <nav class="steps" aria-label="Các bước thiết lập">
+        {% for s in steps %}<a href="{{ url_for('setup', step=s.n) }}"
+          class="{{ 'done' if s.done }} {{ 'on' if s.n == step }}" {{ 'aria-current=step' if s.n == step }}>
+          <b>{{ '✓' if s.done else s.n }}</b>{{ s.title }}</a>{% endfor %}
+      </nav>
+
+      <div class="card">
+      {% if step == 1 %}
+        <h2 style="margin-top:0">Trường đang dạy bộ sách giáo khoa nào?</h2>
+        <p class="muted">Sách khác bộ (ví dụ sách bộ cũ phụ huynh tặng) sẽ được đánh dấu là sách tham khảo.</p>
+        <form method="post"><input type="hidden" name="action" value="edition">
+          {% for e in editions %}
+          <label style="color:var(--ink);font-size:16px;display:flex;align-items:center;gap:4px;padding:6px 0"><input type="radio" name="edition_choice" value="{{ e }}"
+            {{ 'checked' if e == edition }}> {{ e }}</label>{% endfor %}
+          <label style="color:var(--ink);font-size:16px;display:flex;align-items:center;gap:4px;padding:6px 0"><input type="radio" name="edition_choice" value=""
+            {{ 'checked' if cur.done and not edition }}> Chưa phân biệt, dùng mọi sách như nhau</label>
+          <label style="color:var(--ink);font-size:16px;display:flex;align-items:center;gap:4px;padding:6px 0"><input type="radio" name="edition_choice" value="__other"
+            {{ 'checked' if edition and edition not in editions }}> Bộ khác:
+            <input name="edition_other" value="{{ edition if edition not in editions else '' }}" style="display:inline-block;width:auto"></label>
+          <button>Lưu và tiếp tục</button>
+        </form>
+
+      {% elif step == 2 %}
+        <h2 style="margin-top:0">Danh sách học sinh {% if cur.count %}<span class="pill ok">đã có {{ cur.count }} em</span>{% endif %}</h2>
+        <p class="muted">Với mỗi em, hệ thống chỉ cần biết: họ tên, lớp, có thiết bị đọc SGK điện tử không, đã có sách chính thức chưa.</p>
+        <div class="row" style="align-items:stretch">
+          <form method="post" enctype="multipart/form-data" class="card" style="margin:0">
+            <b>Cả lớp từ file Excel/CSV</b>
+            <p class="small muted">Tải <a href="{{ url_for('csv_template', kind='students') }}">file mẫu</a>, điền rồi lưu dạng CSV UTF-8.</p>
+            <input type="hidden" name="action" value="csv"><input type="hidden" name="kind" value="students">
+            <input type="file" name="file" accept=".csv" required><p><button>Nhập file</button></p>
+          </form>
+          <form method="post" class="card" style="margin:0">
+            <b>Từng em</b>
+            <input type="hidden" name="action" value="manual"><input type="hidden" name="kind" value="students">
+            <div class="row"><label>Họ tên<input name="name" required></label><label>Lớp<input name="class_name" required placeholder="6A1"></label></div>
+            <label style="color:var(--ink)"><input type="checkbox" name="has_device" value="1">Có điện thoại/máy tính để đọc SGK điện tử</label>
+            <label style="color:var(--ink)"><input type="checkbox" name="has_own_book" value="1">Đã có sách chính thức</label>
+            <button>Thêm học sinh</button>
+          </form>
+        </div>
+        {% if classes %}<p class="small">Đã có: {% for c in classes %}{{ c.class_name }} ({{ c.n }} em){{ ', ' if not loop.last }}{% endfor %}
+          · <a href="{{ url_for('students') }}">Xem và sửa</a></p>{% endif %}
+
+      {% elif step == 3 %}
+        <h2 style="margin-top:0">Sách đang có trong trường {% if cur.count %}<span class="pill ok">đã có {{ cur.count }} cuốn</span>{% endif %}</h2>
+        <p class="muted">Gồm sách thư viện, sách phụ huynh tặng, sách giáo viên, sách mượn từ trường khác. Mỗi cuốn sẽ có một mã QR riêng.</p>
+        <div class="row" style="align-items:stretch">
+          <form method="post" enctype="multipart/form-data" class="card" style="margin:0">
+            <b>Cả kho từ file Excel/CSV</b>
+            <p class="small muted">Tải <a href="{{ url_for('csv_template', kind='books') }}">file mẫu</a>. Cột <i>quantity</i> là số cuốn giống nhau.</p>
+            <input type="hidden" name="action" value="csv"><input type="hidden" name="kind" value="books">
+            <input type="file" name="file" accept=".csv" required><p><button>Nhập file</button></p>
+          </form>
+          <form method="post" class="card" style="margin:0">
+            <b>Từng loại sách</b>
+            <input type="hidden" name="action" value="manual"><input type="hidden" name="kind" value="books">
+            <div class="row"><label>Môn<input name="subject" required placeholder="Toán"></label>
+              <label>Khối<input name="grade" type="number" min="1" max="12" required></label></div>
+            <div class="row"><label>Lớp giữ<input name="class_name" placeholder="6A1"></label>
+              <label>Số cuốn<input name="quantity" type="number" min="1" value="1"></label></div>
+            <label>Nguồn<select name="source"><option>Thư viện</option><option>Phụ huynh tặng</option>
+              <option>Giáo viên</option><option>Trường khác</option></select></label>
+            <button>Thêm sách</button>
+          </form>
+        </div>
+
+      {% elif step == 4 %}
+        <h2 style="margin-top:0">Thời khóa biểu {% if tt_classes %}<span class="pill ok">đã có {{ tt_classes|length }} lớp</span>{% endif %}</h2>
+        <p class="muted">Dùng để lập lịch chuyển sách giữa các lớp trong buổi học {{ tip(tips.rotation) }}. Mỗi lớp một ảnh.</p>
+        <div class="row" style="align-items:stretch">
+          <div class="card" style="margin:0"><b>Chụp ảnh thời khóa biểu</b>
+            <p class="small muted">Hệ thống tự đọc bảng, bạn kiểm tra lại rồi lưu.</p>
+            <a class="btn" href="{{ url_for('timetable_page', next=url_for('setup', step=4)) }}">Chụp hoặc chọn ảnh</a></div>
+          <form method="post" enctype="multipart/form-data" class="card" style="margin:0">
+            <b>Từ file CSV</b>
+            <p class="small muted">Tải <a href="{{ url_for('csv_template', kind='timetable') }}">file mẫu</a>.</p>
+            <input type="hidden" name="action" value="csv"><input type="hidden" name="kind" value="timetable">
+            <input type="file" name="file" accept=".csv" required><p><button>Nhập file</button></p>
+          </form>
+        </div>
+        {% if tt_classes %}<p class="small">Đã có: {{ tt_classes|join(', ') }} ·
+          <a href="{{ url_for('timetable_page') }}">Xem và sửa</a></p>{% endif %}
+
+      {% else %}
+        <h2 style="margin-top:0">In nhãn QR và dán vào sách</h2>
+        <p class="muted">Mỗi cuốn một nhãn. Dán vào bìa trong. Khi mượn hoặc trả, giáo viên chỉ cần quét nhãn bằng camera điện thoại.</p>
+        {% if preview %}
+        <div class="labels" style="margin-bottom:14px">{% for it in preview %}<div class="label"><img src="{{ it.qr }}" alt="">
+          <b>{{ it.b.subject }} {{ it.b.grade }} · #{{ it.b.id }}</b></div>{% endfor %}</div>
+        <p><a class="btn ghost" href="{{ url_for('labels') }}" target="_blank" rel="noopener">Mở trang in tất cả nhãn</a></p>
+        <form method="post"><input type="hidden" name="action" value="qr_done"><button>Đã in và dán xong</button></form>
+        {% else %}<p>Kho chưa có sách nên chưa có nhãn để in. <a href="{{ url_for('setup', step=3) }}">Quay lại bước nhập sách</a>.</p>{% endif %}
+      {% endif %}
+      </div>
+
+      {% if step in (2, 3, 4) and not cur.done %}
+      <form method="post" class="small muted"><input type="hidden" name="action" value="sample">
+        <input type="hidden" name="kind" value="{{ {2: 'students', 3: 'books', 4: 'timetable'}[step] }}">
+        Chỉ muốn chạy thử? <button class="btn ghost" style="padding:4px 12px">Dùng dữ liệu mẫu</button></form>
+      {% endif %}
+      <div style="display:flex;justify-content:space-between;gap:10px;margin-top:8px">
+        {% if step > 1 %}<a class="btn ghost" href="{{ url_for('setup', step=step - 1) }}">Quay lại</a>{% else %}<span></span>{% endif %}
+        <span>
+          {% if step < 5 %}
+            {% if cur.done %}<a class="btn" href="{{ url_for('setup', step=step + 1) }}">Tiếp tục</a>
+            {% else %}<a class="btn ghost" href="{{ url_for('setup', step=step + 1) }}">Bỏ qua, làm sau</a>{% endif %}
+          {% else %}<a class="btn ghost" href="{{ url_for('today') }}">Để sau, tới trang Hôm nay</a>{% endif %}
+        </span>
+      </div>
+    """, steps=steps, step=step, cur=cur, edition=school_edition(db), editions=EDITION_SUGGESTIONS,
+                preview=preview, classes=classes, tt_classes=tt_classes,
+                sample_loaded=get_setting(db, "sample_loaded") == "1")
+
+
+# ============================================================
+# Hôm nay: việc của giáo viên trong ngày
+# ============================================================
+def period_starts(db):
+    out = []
+    for t in get_setting(db, "period_times", DEFAULT_PERIOD_TIMES).split(","):
+        h, m = t.strip().split(":")
+        out.append(int(h) * 60 + int(m))
+    return out
+
+
+@app.route("/today")
+@teacher_required
+def today():
+    db = get_db()
+    now_dt = clock()
+    day = now_dt.strftime("%Y-%m-%d")
+    minutes = now_dt.hour * 60 + now_dt.minute
+    weekday = now_dt.weekday() + 2          # Thứ 2 = 2 … Chủ nhật = 8
+    steps = setup_steps(db)
+    st = stats(db)
+    if get_setting(db, "setup_seen") != "1" and not all(s["done"] for s in steps):
+        return redirect(url_for("setup"))   # lần đầu đăng nhập: vào trình hướng dẫn
+    closed = program_closed(db)
+
+    # 1. Đầu giờ: sách cần thu về (hạn trả hôm nay hoặc đã quá hạn)
+    returns = db.execute("""SELECT l.*, s.name, s.class_name, b.subject, b.grade FROM loans l
+                            JOIN students s ON s.id = l.student_id JOIN books b ON b.id = l.book_id
+                            WHERE l.returned_at IS NULL AND l.due_at <= ? ORDER BY l.due_at""",
+                         (f"{day} 23:59",)).fetchall()
+
+    # 2. Trong giờ: lịch chuyển sách hôm nay
+    plan = plan_day(db, weekday, day) if weekday in WEEKDAYS else None
+    starts = period_starts(db)
+    start_of = lambda p: starts[p - 1] if p - 1 < len(starts) else None
+    cur_p = nxt_p = None
+    if plan and plan["periods"]:
+        for p in plan["periods"]:
+            s0 = start_of(p)
+            if s0 is None:
+                continue
+            if s0 <= minutes < s0 + PERIOD_MINUTES:
+                cur_p = p
+            elif s0 > minutes and nxt_p is None:
+                nxt_p = p
+    day_start = start_of(plan["periods"][0]) if plan and plan["periods"] else 7 * 60
+    day_end = (start_of(plan["periods"][-1]) or 11 * 60) + PERIOD_MINUTES if plan and plan["periods"] else 11 * 60 + 15
+    phase = "morning" if minutes < (day_start or 420) else ("class" if minutes < day_end else "evening")
+
+    # 3. Cuối giờ: sách còn ở trường + học sinh được gợi ý mượn về nhà
+    ed = school_edition(db)
+    free = db.execute(f"""SELECT b.* FROM books b WHERE b.condition != 'Mất' AND {MATCH_SQL}
+                          AND NOT EXISTS (SELECT 1 FROM loans l WHERE l.book_id = b.id AND l.returned_at IS NULL)
+                          ORDER BY COALESCE(b.class_name, 'zz'), b.grade, b.subject, b.id""", {"ed": ed}).fetchall()
+    groups = {}
+    for b in free:
+        key = (b["class_name"] or "Thư viện", b["subject"], b["grade"])
+        groups.setdefault(key, []).append(b)
+    lend, used = [], set()
+    for (cls, subject, grade), books in groups.items():
+        # Mỗi em chỉ được gợi ý một lần trong danh sách, để sách chia đều cho nhiều em
+        sug = [s for s in suggest_borrowers(db, books[0], limit=20) if s["id"] not in used]
+        if sug:
+            used.add(sug[0]["id"])
+        lend.append(dict(cls=cls, subject=subject, grade=grade, n=len(books), book=books[0],
+                         student=sug[0] if sug else None))
+    lend.sort(key=lambda g: g["student"] is None)
+
+    return page("""
+      <h1>Hôm nay · {{ wd_name }}, {{ date_vn }}</h1>
+      {% if closed %}
+        <div class="card" style="background:var(--ok-bg)"><b>Chương trình chuyển tiếp đã kết thúc.</b>
+          Hệ thống không cho mượn thêm. <a href="{{ url_for('finish') }}">Xem lại hoặc mở lại</a></div>
+      {% elif st.total and st.pct_own == 100 %}
+        <div class="card" style="background:var(--ok-bg)"><b>Tất cả học sinh đã có sách chính thức.</b>
+          Đã đến lúc thu sách về và kết thúc chương trình. <a class="btn" href="{{ url_for('finish') }}">Kết thúc chương trình</a></div>
+      {% endif %}
+      {% if left %}
+        <div class="card"><b>Còn {{ left|length }} bước thiết lập:</b> {{ left|map(attribute='title')|join(', ') }}.
+          <a href="{{ url_for('setup') }}">Làm tiếp</a></div>
+      {% endif %}
+
+      <div class="when"><h2>Đầu giờ: thu sách về</h2>{% if phase == 'morning' %}<span class="now">Bây giờ</span>{% endif %}</div>
+      <div class="card {{ 'section-now' if phase == 'morning' }}">
+        {% if returns %}
+        <p class="small muted" style="margin-top:0">Sách mượn về nhà phải trả trước 7:30 {{ tip(tips.overdue) }}</p>
+        <div class="scroll"><table>
+          <tr><th>Sách</th><th>Học sinh</th><th>Hạn trả</th><th></th></tr>
+          {% for l in returns %}
+          <tr><td><a href="{{ url_for('book_page', book_id=l.book_id) }}">#{{ l.book_id }} {{ l.subject }} {{ l.grade }}</a></td>
+            <td>{{ l.name }} <span class="muted small">{{ l.class_name }}</span></td>
+            <td>{{ l.due_at[11:] if l.due_at[:10] == day else l.due_at }}
+              {% if l.due_at < now_str %}<span class="pill warn">quá hạn</span>{% endif %}</td>
+            <td><form method="post" action="{{ url_for('return_book', book_id=l.book_id) }}" style="margin:0">
+              <input type="hidden" name="next" value="{{ url_for('today') }}">
+              <button class="btn ghost" style="padding:4px 12px">Đã trả</button></form></td></tr>
+          {% endfor %}
+        </table></div>
+        {% else %}<p style="margin:0" class="muted">Không có sách nào cần thu hôm nay.</p>{% endif %}
+      </div>
+
+      <div class="when"><h2>Trong giờ: chuyển sách giữa các lớp {{ tip(tips.rotation) }}</h2>{% if phase == 'class' %}<span class="now">Bây giờ</span>{% endif %}</div>
+      {% if not plan %}
+        <div class="card muted">Hôm nay không có tiết học.</div>
+      {% elif not has_tt %}
+        <div class="card empty"><p>Chưa có thời khóa biểu nên chưa lập được lịch chuyển sách.</p>
+          <a class="btn" href="{{ url_for('timetable_page') }}">Chụp ảnh thời khóa biểu</a></div>
+      {% elif not plan.periods %}
+        <div class="card muted">Thời khóa biểu không có tiết nào vào {{ wd_name }}.</div>
+      {% else %}
+        {% if cur_p %}
+        <div class="card"><b>Đang học: tiết {{ cur_p }}</b>
+          <p class="small" style="margin:6px 0 0">{% for r in plan.rows[cur_p] if r.students %}{{ r.class_name }} học {{ r.subject }}
+            với {{ r.got }} cuốn{{ '; ' if not loop.last }}{% else %}<span class="muted">Không lớp nào cần sách.</span>{% endfor %}</p>
+        </div>{% endif %}
+        {% if nxt_p %}
+        <div class="card {{ 'section-now' if phase in ('class', 'morning') }}"><b>Chuẩn bị cho tiết {{ nxt_p }}{{ ' (giờ ra chơi)' if cur_p }}</b>
+          {% if plan.moves[nxt_p] %}<ul style="margin-bottom:0">{% for m in plan.moves[nxt_p] %}
+            <li>Chuyển <b>{{ m.n }}</b> cuốn {{ m.subject }} {{ m.grade }}: {{ m.src }} → <b>{{ m.dst }}</b></li>{% endfor %}</ul>
+          {% else %}<p class="muted small" style="margin:6px 0 0">Không cần chuyển sách: sách đã ở đúng lớp.</p>{% endif %}
+        </div>
+        {% elif not cur_p %}<div class="card muted">Các tiết hôm nay đã xong. Nhớ trả sách về lớp giữ:
+          {% for m in plan.end_moves %}{{ m.n }} cuốn {{ m.subject }} {{ m.src }} → {{ m.dst }}{{ '; ' if not loop.last }}{% else %}không cần chuyển gì.{% endfor %}</div>
+        {% endif %}
+        <details class="card"><summary><b>Lịch cả buổi</b> · {{ plan.n_moves }} lượt chuyển,
+          {{ plan.pct_with }}% học sinh có sách trên lớp</summary>
+          {% for p in plan.periods %}
+          <p style="margin:12px 0 4px"><b>Tiết {{ p }}</b>{% if not plan.moves[p] %} <span class="muted small">không cần chuyển</span>{% endif %}</p>
+          {% if plan.moves[p] %}<ul style="margin:0">{% for m in plan.moves[p] %}
+            <li>{{ m.n }} cuốn {{ m.subject }} {{ m.grade }}: {{ m.src }} → {{ m.dst }}</li>{% endfor %}</ul>{% endif %}
+          {% endfor %}
+          <p><a href="{{ url_for('schedule', day=weekday) }}">Xem chi tiết và in lịch</a></p>
+        </details>
+      {% endif %}
+
+      <div class="when"><h2>Cuối giờ: cho mượn về nhà</h2>{% if phase == 'evening' %}<span class="now">Bây giờ</span>{% endif %}</div>
+      <div class="card {{ 'section-now' if phase == 'evening' }}">
+        {% if closed %}<p style="margin:0" class="muted">Chương trình đã kết thúc.</p>
+        {% elif lend %}
+        <p class="small muted" style="margin-top:0">Gợi ý ưu tiên em không có thiết bị, rồi em ít được mượn nhất.
+          Cho mượn xong, em tiếp theo sẽ hiện ra.</p>
+        <div class="scroll"><table>
+          <tr><th>Sách còn ở trường</th><th>Gợi ý cho mượn</th><th></th></tr>
+          {% for g in lend %}
+          <tr><td><b>{{ g.subject }} {{ g.grade }}</b> <span class="muted small">{{ g.cls }} · còn {{ g.n }} cuốn</span></td>
+            <td>{% if g.student %}{{ g.student.name }} <span class="muted small">{{ g.student.class_name }}
+              {% if not g.student.has_device %}· không thiết bị{% endif %}</span>
+              {% else %}<span class="muted small">Không còn em nào cần mượn môn này</span>{% endif %}</td>
+            <td>{% if g.student %}<form method="post" action="{{ url_for('borrow', book_id=g.book.id) }}" style="margin:0">
+              <input type="hidden" name="student_id" value="{{ g.student.id }}">
+              <input type="hidden" name="next" value="{{ url_for('today') }}">
+              <button style="padding:6px 14px">Cho mượn #{{ g.book.id }}</button></form>{% endif %}</td></tr>
+          {% endfor %}
+        </table></div>
+        {% else %}<p style="margin:0" class="muted">Không còn sách nào ở trường để cho mượn.</p>{% endif %}
+      </div>
+    """, wd_name=WEEKDAYS.get(weekday, "Chủ nhật"), date_vn=now_dt.strftime("%d/%m/%Y"), closed=closed, st=st,
+                left=[s for s in steps if not s["done"]], phase=phase, returns=returns, day=day,
+                now_str=now_dt.strftime("%Y-%m-%d %H:%M"), plan=plan, cur_p=cur_p, nxt_p=nxt_p, weekday=weekday,
+                has_tt=db.execute("SELECT 1 FROM timetable LIMIT 1").fetchone() is not None, lend=lend)
+
+
+# ============================================================
+# Quét sách
+# ============================================================
+@app.route("/scan")
+@teacher_required
+def scan():
+    book_id = request.args.get("id", type=int)
+    if book_id:
+        if get_db().execute("SELECT 1 FROM books WHERE id = ?", (book_id,)).fetchone():
+            return redirect(url_for("book_page", book_id=book_id))
+        flash(f"Không có cuốn sách số {book_id}. Kiểm tra lại số in dưới mã QR.", "error")
+    return page("""
+      <h1>Quét sách</h1>
+      <div class="card narrow">
+        <p style="margin-top:0"><b>Cách nhanh nhất:</b> mở camera của điện thoại, hướng vào mã QR dán trong bìa sách,
+          rồi chạm vào đường link hiện ra. Trang của cuốn sách sẽ mở để cho mượn hoặc nhận trả.</p>
+        <p class="small muted">Điện thoại cần kết nối cùng Wi-Fi với máy chạy Sách Chung.</p>
+      </div>
+      <form class="card narrow" method="get">
+        <label>Hoặc gõ số sách (in dưới mã QR, ví dụ #12)
+          <input name="id" type="number" min="1" inputmode="numeric" required autofocus></label>
+        <button class="big">Mở trang sách</button>
+      </form>""")
+
+
+# ============================================================
+# Kết thúc chương trình chuyển tiếp
+# ============================================================
+@app.route("/finish", methods=["GET", "POST"])
+@teacher_required
+def finish():
+    db = get_db()
+    if request.method == "POST":
+        if request.form.get("action") == "close":
+            set_setting(db, "program_closed", "1")
+            flash("Đã đóng chương trình. Dữ liệu vẫn được giữ, có thể mở lại bất cứ lúc nào.")
+        elif request.form.get("action") == "reopen":
+            set_setting(db, "program_closed", "0")
+            flash("Đã mở lại chương trình, có thể cho mượn tiếp.")
+        db.commit()
+        return redirect(url_for("finish"))
+    st = stats(db)
+    out = db.execute("""SELECT l.book_id, s.name, s.class_name, b.subject, b.grade FROM loans l
+                        JOIN students s ON s.id = l.student_id JOIN books b ON b.id = l.book_id
+                        WHERE l.returned_at IS NULL ORDER BY s.class_name, s.name""").fetchall()
+    held = db.execute("""SELECT COALESCE(class_name, 'Thư viện') AS cls, COUNT(*) AS n FROM books
+                         WHERE condition != 'Mất' GROUP BY 1 ORDER BY 1""").fetchall()
+    return page("""
+      <h1>Kết thúc chương trình</h1>
+      <p class="muted" style="margin-top:-8px">{{ st.own }}/{{ st.total }} học sinh đã có sách chính thức ({{ st.pct_own }}%).
+        {% if st.pct_own < 100 %}Vẫn có thể kết thúc sớm nếu trường quyết định.{% endif %}</p>
+      <div class="card"><h2 style="margin-top:0">1. Thu sách về thư viện</h2>
+        {% if out %}<p>Còn <b>{{ out|length }}</b> cuốn đang ở nhà học sinh:</p>
+          <ul>{% for o in out %}<li>{{ o.class_name }} – {{ o.name }}: #{{ o.book_id }} {{ o.subject }} {{ o.grade }}</li>{% endfor %}</ul>
+        {% else %}<p>Không còn cuốn nào ở nhà học sinh.</p>{% endif %}
+        <p class="small muted" style="margin-bottom:0">Sách đang để ở các lớp:
+          {% for h in held %}{{ h.cls }} ({{ h.n }}){{ ', ' if not loop.last }}{% endfor %}.</p></div>
+      <div class="card"><h2 style="margin-top:0">2. Lưu nhật ký mượn</h2>
+        <p>File CSV ghi lại mọi lượt mượn và trả, dùng để báo cáo với nhà trường.</p>
+        <a class="btn ghost" href="{{ url_for('export_loans') }}">Tải nhật ký mượn (CSV)</a></div>
+      <div class="card"><h2 style="margin-top:0">3. Đóng chương trình</h2>
+        {% if closed %}<p><span class="pill ok">Đã đóng</span> Hệ thống không cho mượn thêm. Dữ liệu vẫn còn.</p>
+          <form method="post"><input type="hidden" name="action" value="reopen"><button class="btn ghost">Mở lại chương trình</button></form>
+        {% else %}<p>Sau khi đóng, hệ thống không cho mượn thêm. Trả sách, xem báo cáo và tải nhật ký vẫn dùng được.</p>
+          <form method="post"><input type="hidden" name="action" value="close"><button>Đóng chương trình</button></form>{% endif %}
+      </div>""", st=st, out=out, held=held, closed=program_closed(db))
 
 
 @app.errorhandler(404)

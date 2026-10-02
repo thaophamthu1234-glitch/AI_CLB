@@ -21,7 +21,7 @@ python app.py
 - Trên điện thoại (phải cùng Wi-Fi): dùng địa chỉ `http://<IP>:5000` được in ra trong terminal khi khởi động.
 - Mã PIN giáo viên mặc định là `1234`. Có thể đổi bằng biến môi trường `SACH_CHUNG_PIN`.
 
-Ở lần chạy đầu tiên, dữ liệu mẫu trong `data/` được nạp tự động. DB cũ được tự nâng cấp, không mất dữ liệu. Muốn làm lại từ đầu thì xóa file `sach_chung.db`.
+Ở lần chạy đầu tiên, dữ liệu mẫu trong `data/` được nạp tự động. DB cũ được tự nâng cấp, không mất dữ liệu. Muốn bắt đầu với dữ liệu thật, bấm *Xóa dữ liệu mẫu* trong *Thiết lập ban đầu*.
 
 ### Nhập thời khóa biểu bằng ảnh (tùy chọn, dùng PaddleOCR-VL)
 
@@ -43,13 +43,38 @@ Khi đưa lên mạng, hãy đặt `SACH_CHUNG_PIN` và `SACH_CHUNG_SECRET` khá
 
 ## Quy trình sử dụng
 
-1. **Kiểm kê:** nhập danh sách học sinh và sách bằng CSV (trang *Nhập CSV*) hoặc nhập tay. Với mỗi học sinh, ghi rõ em đó có thiết bị không và đã có sách chính thức chưa. Vào *Cài đặt* chọn bộ sách trường đang dạy: sách khác bộ (vd phụ huynh tặng sách bộ cũ) được đánh dấu *tham khảo*.
-2. **Thời khóa biểu:** chụp ảnh TKB từng lớp (hoặc nhập CSV). Trang *Lịch chuyển sách* cho biết trước mỗi tiết cần chuyển bao nhiêu cuốn từ lớp nào sang lớp nào, để một bộ sách phục vụ nhiều lớp trong cùng buổi.
-3. **In nhãn QR:** mở trang *In nhãn QR*, in ra, cắt và dán vào bìa trong của từng cuốn sách. Nhớ in bằng địa chỉ LAN, không dùng `localhost`.
-4. **Mượn/trả:** giáo viên dùng camera điện thoại quét mã QR trên sách. Màn hình hiện danh sách học sinh được gợi ý theo thứ tự ưu tiên; chạm vào tên là xong. Khi học sinh trả sách, quét lại mã và bấm "Đã trả".
-5. **Trên lớp:** giáo viên mở SGK điện tử lên TV hoặc máy chiếu. Trang *Bài tuần này* (công khai, không cần đăng nhập) có link tới SGK điện tử và phiếu học tập do giáo viên tự soạn.
-6. **Học sinh không có thiết bị:** ở *Bài tuần này* bấm *In phiếu học tập* để in phiếu A4 gồm tên bài, nhiệm vụ do giáo viên soạn, dòng kẻ để trả lời và mã QR tới SGK điện tử. Hệ thống tính sẵn số bản cần in.
-7. **Kết thúc:** khi học sinh nhận được sách chính thức, giáo viên bấm "✔ Có" ở cột *Sách chính thức*. Khi đạt 100%, tải nhật ký mượn (CSV) và thu sách về thư viện.
+### Lần đầu: Thiết lập ban đầu (khoảng 15 phút)
+
+Giáo viên đăng nhập lần đầu sẽ được đưa vào trình hướng dẫn 5 bước. Bước nào chưa sẵn sàng có thể bỏ qua; trang *Hôm nay* sẽ nhắc các bước còn thiếu.
+
+1. **Chọn bộ sách** trường đang dạy. Sách khác bộ (vd sách bộ cũ phụ huynh tặng) được đánh dấu *tham khảo*.
+2. **Nhập học sinh:** file CSV (có file mẫu để tải) hoặc gõ từng em. Mỗi em chỉ cần họ tên, lớp, có thiết bị không, đã có sách chính thức chưa.
+3. **Nhập sách** đang có trong trường: thư viện, phụ huynh tặng, giáo viên, trường khác.
+4. **Thời khóa biểu:** chụp ảnh TKB từng lớp (hệ thống tự đọc bằng PaddleOCR-VL) hoặc nhập CSV.
+5. **In nhãn QR**, cắt và dán vào bìa trong của từng cuốn. Nhớ mở app bằng địa chỉ LAN, không dùng `localhost`.
+
+Hệ thống có sẵn dữ liệu mẫu để chạy thử. Khi nhập dữ liệu thật, bấm *Xóa dữ liệu mẫu* ở đầu trình hướng dẫn.
+
+### Hằng ngày: trang Hôm nay
+
+Sau khi đăng nhập, giáo viên vào thẳng trang *Hôm nay*. Phần ứng với giờ hiện tại được đánh dấu *Bây giờ*:
+
+- **Đầu giờ:** sách cần thu về (hạn 7:30, quá hạn tô đỏ). Bấm *Đã trả* ngay trên danh sách.
+- **Trong giờ:** tiết đang học và việc cần làm trong giờ ra chơi (chuyển bao nhiêu cuốn từ lớp nào sang lớp nào). Giờ bắt đầu các tiết chỉnh trong *Cài đặt*.
+- **Cuối giờ:** sách còn ở trường kèm học sinh được gợi ý mượn về nhà. Bấm *Cho mượn* là xong; mỗi em chỉ được gợi ý một lần để sách chia đều.
+
+Trên điện thoại có nút **Quét sách** cố định cuối màn hình: dùng camera quét mã QR trên sách (hoặc gõ số sách) để mở trang mượn/trả.
+
+### Thanh điều hướng
+
+- Giáo viên: **Hôm nay · Quét sách · Quản lý** (học sinh, kho sách, thời khóa biểu, lịch chuyển sách, in nhãn, nhập dữ liệu, bài tuần này, cài đặt) **· Báo cáo** (tổng quan, đang mượn, tải nhật ký).
+- Học sinh và phụ huynh không cần đăng nhập, chỉ thấy trang **Bài tuần này**: link SGK điện tử miễn phí và phiếu học tập in được cho em không có thiết bị.
+
+Cạnh các khái niệm mới (*sách tham khảo*, *xoay vòng*, *chưa từng được mượn*, *quá hạn*) có dấu **?**, bấm vào để xem giải thích.
+
+### Kết thúc chương trình
+
+Khi 100% học sinh có sách chính thức, trang *Hôm nay* hiện nút *Kết thúc chương trình* gồm 3 bước: danh sách sách cần thu về, tải nhật ký mượn (CSV), đóng chương trình. Sau khi đóng, hệ thống không cho mượn thêm nhưng vẫn giữ dữ liệu và có thể mở lại.
 
 ## Thuật toán gợi ý người mượn
 
