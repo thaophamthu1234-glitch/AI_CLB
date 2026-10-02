@@ -4,7 +4,7 @@ App Sách Chung ở trường (kể cả bản .exe không có PaddleOCR) gửi 
 máy chủ đọc bảng bằng PaddleOCR-VL rồi trả kết quả về. Chỉ nhận yêu cầu có đúng mã bí mật.
 
 Chạy:  ocr_server.bat   (hoặc: python ocr_server.py)
-Đưa ra internet: ngrok http --url=<tên-miền-ngrok-của-bạn> 8765   (ocr_server.bat tự làm nếu đã cấu hình)
+Đưa ra internet: ngrok http --domain=<tên-miền-ngrok-của-bạn> 8765   (ocr_server.bat tự làm nếu đã cấu hình)
 
 Cấu hình lưu ở ocr_server_config.json (tự tạo lần đầu, không đẩy lên GitHub):
   token  – mã bí mật; dán vào Cài đặt → Máy chủ OCR của app

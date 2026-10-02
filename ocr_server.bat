@@ -14,7 +14,7 @@ set "NG=ngrok"
 if exist ngrok.exe set "NG=%~dp0ngrok.exe"
 if defined NGROK_DOMAIN (
   echo Dang mo duong ham ngrok: https://%NGROK_DOMAIN%
-  start "ngrok - Sach Chung OCR" "%NG%" http --url=%NGROK_DOMAIN% 8765
+  start "ngrok - Sach Chung OCR" "%NG%" http --domain=%NGROK_DOMAIN% 8765
 ) else (
   echo Chua co ngrok_domain.txt: may chu chi nhan yeu cau tren may nay.
 )
