@@ -39,6 +39,38 @@ Trang *Thời khóa biểu* ghi rõ app đang chạy bằng Python nào và vì 
 Nếu đã chạy sẵn PaddleOCR-VL qua vLLM, đặt `SACH_CHUNG_OCR_BACKEND=vllm-server` và `SACH_CHUNG_OCR_SERVER=http://127.0.0.1:8118/v1`.
 Không cài OCR thì app vẫn chạy bình thường, thời khóa biểu nhập bằng CSV.
 
+### Bản .exe cho Windows (không cần cài Python)
+
+Người dùng chỉ cần tải `SachChung-windows.zip` ở mục **Releases** của repo, giải nén và nhấp đúp `SachChung.exe`.
+Dữ liệu lưu trong `sach_chung.db` cạnh file .exe.
+
+Để tự đóng gói: nhấp đúp `build_exe.bat` trên Windows. Kết quả nằm ở `dist\SachChung\` và `SachChung-windows.zip`.
+Bản .exe không kèm PaddleOCR; tính năng đọc ảnh TKB dùng **máy chủ OCR** bên dưới.
+
+### Máy chủ OCR: cho máy không có GPU dùng PaddleOCR-VL của máy khác
+
+```
+Máy trường (SachChung.exe) ── ảnh TKB + mã bí mật ──► ngrok ──► ocr_server.py (máy có GPU)
+                           ◄────────── bảng đọc được ─────────
+```
+
+Trên máy có GPU và đã cài PaddleOCR-VL:
+
+1. Đăng ký tài khoản miễn phí tại https://ngrok.com, tải `ngrok.exe` đặt vào thư mục này
+   và chạy một lần `ngrok config add-authtoken <authtoken trong trang ngrok>`.
+2. Trong trang ngrok, mục **Domains**, nhận một tên miền tĩnh miễn phí (vd `ten-ban.ngrok-free.app`)
+   và ghi tên miền đó vào file `ngrok_domain.txt`.
+3. Nhấp đúp `ocr_server.bat`. Cửa sổ hiện **mã bí mật (token)**; cửa sổ thứ hai là đường hầm ngrok.
+   Lần đầu chạy, `ocr_server_config.json` được tạo để lưu mã bí mật (không đẩy lên GitHub).
+
+Trên máy dùng app: *Quản lý → Cài đặt → Máy chủ OCR*, điền `https://ten-ban.ngrok-free.app` và mã bí mật,
+bấm *Lưu và kiểm tra kết nối*.
+
+Máy chủ chỉ nhận yêu cầu có đúng mã bí mật, đọc từng ảnh một, không lưu ảnh lại.
+Khi máy chủ tắt, app báo rõ và giáo viên vẫn nhập TKB bằng file CSV.
+Dùng trong cùng Wi-Fi mà không cần ngrok: đặt `"host": "0.0.0.0"` trong `ocr_server_config.json`
+và điền `http://<IP máy có GPU>:8765` vào app.
+
 ### Đưa lên mạng (để ban giám khảo bấm link là dùng được)
 
 - **PythonAnywhere (miễn phí):** upload thư mục, tạo Web app *Manual configuration*, trong file WSGI ghi
@@ -125,6 +157,9 @@ sach-chung/
 ├── app.py            # toàn bộ ứng dụng (Flask + SQLite)
 ├── timetable_ocr.py  # đọc ảnh thời khóa biểu bằng PaddleOCR-VL → bảng → CSV
 ├── run.bat / run.sh  # chạy một chạm
+├── build_exe.bat     # đóng gói SachChung.exe
+├── ocr_server.py/.bat# máy chủ OCR cho máy khác gọi tới (qua ngrok)
+├── assets/           # icon, hướng dẫn đi kèm bản .exe
 ├── requirements.txt
 ├── requirements-ocr.txt  # tùy chọn, cho tính năng đọc ảnh
 ├── data/             # dữ liệu mẫu (hư cấu); data/ocr/ chứa CSV xuất từ ảnh TKB

@@ -96,6 +96,63 @@ def ocr_image(path):
 
 
 # ============================================================
+# 1b. Gửi ảnh tới máy chủ OCR từ xa (ocr_server.py chạy trên máy có GPU)
+# ============================================================
+class RemoteOCRError(RuntimeError):
+    pass
+
+
+def _remote_request(url, token, path, body=None, content_type=None, timeout=15):
+    import json
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url.rstrip("/") + path, data=body, method="POST" if body else "GET")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("ngrok-skip-browser-warning", "1")   # bỏ trang cảnh báo của ngrok bản miễn phí
+    req.add_header("User-Agent", "SachChung/1.0")
+    if content_type:
+        req.add_header("Content-Type", content_type)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error", "")
+        except Exception:
+            msg = ""
+        if e.code == 401:
+            raise RemoteOCRError("Máy chủ OCR từ chối: mã bí mật không đúng. Kiểm tra lại trong Cài đặt.")
+        if e.code in (404, 502, 503, 504):
+            raise RemoteOCRError("Máy chủ OCR không phản hồi (máy đang tắt hoặc chưa chạy ocr_server). "
+                                 "Thử lại sau, hoặc nhập thời khóa biểu bằng file CSV.")
+        raise RemoteOCRError(f"Máy chủ OCR báo lỗi {e.code}: {msg or e.reason}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        raise RemoteOCRError(f"Không kết nối được máy chủ OCR ({reason}). Máy chủ có thể đang tắt; "
+                             "thử lại sau, hoặc nhập thời khóa biểu bằng file CSV.")
+
+
+def remote_health(url, token):
+    """Kiểm tra máy chủ OCR: trả về dict {"ok": bool, "detail": str}."""
+    return _remote_request(url, token, "/health")
+
+
+def remote_ocr_image(path, url, token, timeout=300):
+    """Gửi ảnh tới máy chủ OCR, nhận Markdown. Lần đầu máy chủ nạp model nên có thể mất 1–2 phút."""
+    import uuid
+    boundary = uuid.uuid4().hex
+    with open(path, "rb") as f:
+        data = f.read()
+    name = os.path.basename(path)
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{name}\"\r\n"
+            f"Content-Type: application/octet-stream\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+    res = _remote_request(url, token, "/ocr", body, f"multipart/form-data; boundary={boundary}", timeout)
+    if "markdown" not in res:
+        raise RemoteOCRError(res.get("error") or "Máy chủ OCR trả về kết quả không hợp lệ.")
+    return res["markdown"]
+
+
+# ============================================================
 # 2. Tách bảng từ Markdown/HTML
 # ============================================================
 class _TableParser(HTMLParser):

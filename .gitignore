@@ -8,3 +8,10 @@ data/ocr/
 python.txt
 _to_delete/
 *.bak2
+ocr_server_config.json
+ngrok_domain.txt
+ngrok.exe
+build/
+dist/
+*.spec
+SachChung-windows.zip

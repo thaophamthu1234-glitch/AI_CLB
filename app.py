@@ -13,6 +13,7 @@ import os
 import re
 import socket
 import sqlite3
+import sys
 import tempfile
 import threading
 import webbrowser
@@ -27,7 +28,16 @@ import timetable_ocr
 from flask import (Flask, Response, abort, flash, g, redirect, render_template_string,
                    request, session, url_for)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Cửa sổ dòng lệnh Windows có thể không dùng UTF-8: tránh lỗi khi in tiếng Việt
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# Khi chạy từ bản .exe (PyInstaller), dữ liệu nằm cạnh file .exe để còn ghi được
+FROZEN = getattr(sys, "frozen", False)
+BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if FROZEN else __file__))
 DB_PATH = os.path.join(BASE_DIR, "sach_chung.db")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 TEACHER_PIN = os.environ.get("SACH_CHUNG_PIN", "1234")
@@ -1341,6 +1351,25 @@ def import_page():
 @teacher_required
 def settings_page():
     db = get_db()
+    if request.method == "POST" and request.form.get("action") in ("ocr", "test_ocr"):
+        url = (request.form.get("ocr_url") or "").strip().rstrip("/")
+        if url and not url.startswith(("http://", "https://")):
+            # ngrok/tên miền → https; localhost, IP nội bộ hoặc có ghi cổng → http
+            local = re.match(r"(localhost|\d+\.\d+\.\d+\.\d+)(:|/|$)", url) or re.search(r":\d+(/|$)", url)
+            url = ("http://" if local else "https://") + url
+        set_setting(db, "ocr_url", url)
+        set_setting(db, "ocr_token", (request.form.get("ocr_token") or "").strip())
+        db.commit()
+        if request.form.get("action") == "test_ocr" and url:
+            try:
+                h = timetable_ocr.remote_health(url, get_setting(db, "ocr_token"))
+                flash(("Kết nối được máy chủ OCR. " if h.get("ok") else "Kết nối được, nhưng máy chủ chưa đọc được ảnh: ")
+                      + h.get("detail", ""), "" if h.get("ok") else "error")
+            except timetable_ocr.RemoteOCRError as e:
+                flash(str(e), "error")
+        else:
+            flash("Đã lưu máy chủ OCR." if url else "Đã tắt máy chủ OCR từ xa.")
+        return redirect(url_for("settings_page") + "#ocr")
     if request.method == "POST":
         set_setting(db, "edition", (request.form.get("edition") or "").strip())
         set_setting(db, "edition_set", "1")
@@ -1373,8 +1402,20 @@ def settings_page():
         {% for r in by_ed %}<tr><td>{{ r.ed or '(không ghi – tính theo bộ trường dạy)' }}</td><td>{{ r.n }}</td>
           <td>{% if r.ed and edition and r.ed != edition %}<span class="pill warn">tham khảo</span>
               {% else %}<span class="pill ok">đúng bộ</span>{% endif %}</td></tr>{% endfor %}
-      </table></div>""", edition=edition, editions=EDITION_SUGGESTIONS, by_ed=by_ed,
-                period_times=get_setting(db, "period_times", DEFAULT_PERIOD_TIMES), minutes=PERIOD_MINUTES)
+      </table></div>
+      <h2 id="ocr">Máy chủ OCR</h2>
+      <form method="post" class="card narrow">
+        <p style="margin-top:0" class="small muted">Dùng khi máy này không cài PaddleOCR-VL: ảnh thời khóa biểu được gửi tới
+          một máy có GPU đang chạy <code>ocr_server.bat</code>, máy đó đọc bảng rồi trả kết quả về. Ảnh không được lưu lại.</p>
+        {% if local_ok %}<p class="flash">Máy này đã có PaddleOCR nên đọc ảnh ngay tại chỗ; máy chủ OCR chỉ dùng khi bạn tắt PaddleOCR.</p>{% endif %}
+        <label>Địa chỉ máy chủ OCR<input name="ocr_url" value="{{ ocr_url }}" placeholder="https://ten-ban.ngrok-free.app"></label>
+        <label>Mã bí mật (token)<input name="ocr_token" value="{{ ocr_token }}" type="password" autocomplete="off"></label>
+        <button name="action" value="ocr">Lưu</button>
+        <button name="action" value="test_ocr" class="btn ghost">Lưu và kiểm tra kết nối</button>
+      </form>""", edition=edition, editions=EDITION_SUGGESTIONS, by_ed=by_ed,
+                period_times=get_setting(db, "period_times", DEFAULT_PERIOD_TIMES), minutes=PERIOD_MINUTES,
+                ocr_url=get_setting(db, "ocr_url"), ocr_token=get_setting(db, "ocr_token"),
+                local_ok=timetable_ocr.ocr_available())
 
 
 # ============================================================
@@ -1442,6 +1483,18 @@ def schedule():
 # ============================================================
 # Thời khóa biểu: xem, nhập bằng ảnh (PaddleOCR-VL), xuất CSV
 # ============================================================
+def ocr_mode(db):
+    """Chọn cách đọc ảnh: PaddleOCR trên máy này → máy chủ OCR từ xa → không có.
+    Trả về (mode, chi tiết): ("local", ""), ("remote", url) hoặc (None, lý do)."""
+    ok, why = timetable_ocr.ocr_status()
+    if ok:
+        return "local", ""
+    url = os.environ.get("SACH_CHUNG_OCR_URL") or get_setting(db, "ocr_url")
+    if url:
+        return "remote", url
+    return None, why + " Hoặc khai báo một máy chủ OCR trong Quản lý → Cài đặt."
+
+
 def known_subjects(db):
     return [r[0] for r in db.execute("SELECT subject FROM books UNION SELECT subject FROM timetable "
                                      "UNION SELECT subject FROM lessons")]
@@ -1483,14 +1536,16 @@ def timetable_page():
     rows = db.execute("SELECT * FROM timetable WHERE class_name = ?", (cls,)).fetchall()
     grid = timetable_grid(rows)
     periods = range(1, max(grid or [0]) + 1)
-    ocr_ok, ocr_why = timetable_ocr.ocr_status()
+    mode, detail = ocr_mode(db)
+    ocr_ok, ocr_why = mode is not None, detail
     return page("""
       <h1>Thời khóa biểu</h1>
       <form method="post" action="{{ url_for('timetable_scan') }}" enctype="multipart/form-data" class="card">
         <h2 style="margin-top:0">📷 Nhập bằng ảnh chụp</h2>
         <p class="small muted" style="margin-top:0">Chụp thẳng, đủ sáng, rõ toàn bộ bảng của <b>một lớp</b>.
           Hệ thống dùng PaddleOCR-VL đọc bảng, rồi cho bạn xem lại và sửa trước khi lưu.</p>
-        {% if not ocr_ok %}<div class="flash error">{{ hint }}</div>{% endif %}
+        {% if not ocr_ok %}<div class="flash error">{{ hint }}</div>
+        {% elif hint %}<p class="small muted">Ảnh sẽ được gửi tới máy chủ OCR {{ hint }}. Lần đọc đầu có thể mất 1–2 phút.</p>{% endif %}
         <div class="row">
           <label>Ảnh thời khóa biểu<input type="file" name="image" accept="image/*" capture="environment" required></label>
           <label>Lớp (để trống = tự đọc từ ảnh)<input name="class_name" placeholder="6A1"></label>
@@ -1526,9 +1581,15 @@ def timetable_scan():
     ext = os.path.splitext(f.filename)[1].lower() or ".jpg"
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp.write(data)
+    db = get_db()
+    mode, url = ocr_mode(db)
     try:
-        markdown = timetable_ocr.ocr_image(tmp.name)
-    except Exception as e:   # chưa cài, hết VRAM, ảnh hỏng...
+        if mode == "remote":
+            token = os.environ.get("SACH_CHUNG_OCR_TOKEN") or get_setting(db, "ocr_token")
+            markdown = timetable_ocr.remote_ocr_image(tmp.name, url, token)
+        else:
+            markdown = timetable_ocr.ocr_image(tmp.name)
+    except Exception as e:   # chưa cài, hết VRAM, ảnh hỏng, máy chủ OCR tắt...
         flash(f"Không đọc được ảnh: {e}", "error")
         return redirect(url_for("timetable_page"))
     finally:
@@ -2154,6 +2215,6 @@ if __name__ == "__main__":
     print(f"  Điện thoại   : http://{ip}:5000   (cùng Wi-Fi)")
     print(f"  PIN giáo viên: {TEACHER_PIN}")
     print("=" * 60)
-    if os.environ.get("SACH_CHUNG_OPEN"):   # run.bat bật biến này để tự mở trình duyệt
+    if os.environ.get("SACH_CHUNG_OPEN") or FROZEN:   # run.bat / bản .exe tự mở trình duyệt
         threading.Timer(1.5, lambda: webbrowser.open("http://localhost:5000")).start()
     app.run(host="0.0.0.0", port=5000, debug=False)

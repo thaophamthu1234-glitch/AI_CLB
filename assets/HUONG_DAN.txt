@@ -1,0 +1,16 @@
+﻿SÁCH CHUNG – điều phối mượn sách giáo khoa luân phiên
+
+CÁCH CHẠY
+1. Giải nén cả thư mục SachChung (đừng chỉ chép riêng file .exe).
+2. Nhấp đúp SachChung.exe. Trình duyệt tự mở trang http://localhost:5000
+   Nếu Windows hỏi về tường lửa, chọn "Cho phép" để điện thoại cùng Wi-Fi truy cập được.
+3. Đăng nhập giáo viên bằng mã PIN 1234 và làm theo trang "Thiết lập ban đầu".
+4. Điện thoại cùng Wi-Fi: mở địa chỉ http://<IP>:5000 hiện trong cửa sổ đen.
+
+Đóng cửa sổ đen là tắt app. Dữ liệu lưu trong file sach_chung.db cạnh SachChung.exe;
+sao lưu file này là sao lưu toàn bộ dữ liệu.
+
+ĐỌC THỜI KHÓA BIỂU TỪ ẢNH
+Bản .exe không kèm PaddleOCR (rất nặng, cần card đồ họa). Để dùng tính năng chụp ảnh TKB:
+vào Quản lý → Cài đặt → Máy chủ OCR, điền địa chỉ và mã bí mật do người quản trị cung cấp,
+bấm "Lưu và kiểm tra kết nối". Không có máy chủ OCR thì vẫn nhập TKB bằng file CSV.
