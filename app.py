@@ -46,6 +46,7 @@ EBOOK_HOME = "https://taphuan.nxbgd.vn"   # SGK điện tử miễn phí chính 
 SHARE_PER_BOOK = 2              # trên lớp: 2 học sinh ngồi cùng bàn dùng chung 1 cuốn
 EDITION_SUGGESTIONS = ["Kết nối tri thức với cuộc sống", "Chân trời sáng tạo", "Cánh diều"]
 PERIOD_MINUTES = 45
+LABELS_PER_PAGE = 300           # kho sách lớn hơn mức này thì trang In nhãn mặc định lọc theo lớp
 DEFAULT_PERIOD_TIMES = "07:00,07:50,08:40,09:35,10:25,13:00,13:50,14:40,15:35,16:25"   # giờ bắt đầu tiết 1..10
 WEEKDAYS = {2: "Thứ 2", 3: "Thứ 3", 4: "Thứ 4", 5: "Thứ 5", 6: "Thứ 6", 7: "Thứ 7"}
 
@@ -103,6 +104,38 @@ CREATE TABLE IF NOT EXISTS timetable (
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+-- Chỉ mục: không có thì mọi truy vấn "học sinh này đã mượn gì / sách này đang ở đâu" phải quét
+-- toàn bộ bảng loans -> trang Hôm nay mất hàng chục giây khi trường có vài nghìn học sinh.
+CREATE INDEX IF NOT EXISTS idx_loans_book ON loans(book_id, returned_at);
+CREATE INDEX IF NOT EXISTS idx_loans_student ON loans(student_id, returned_at);
+CREATE INDEX IF NOT EXISTS idx_loans_open ON loans(returned_at, due_at);
+CREATE INDEX IF NOT EXISTS idx_students_class ON students(class_name, has_own_book);
+CREATE INDEX IF NOT EXISTS idx_books_class ON books(class_name, subject);
+CREATE INDEX IF NOT EXISTS idx_books_subject ON books(subject, grade);
+CREATE INDEX IF NOT EXISTS idx_timetable_day ON timetable(weekday, period);
+-- Nhật ký giao nhận: mọi lần sách đổi chỗ (mượn, trả, chuyển tay, chuyển lớp, báo mất, tìm thấy).
+-- Lưu cả tên học sinh để lịch sử còn nguyên kể cả khi học sinh/sách bị xóa sau này.
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    kind TEXT NOT NULL,              -- borrow | return | handover | transfer | short | found | lost
+    book_id INTEGER, subject TEXT, grade INTEGER, n INTEGER,
+    src TEXT, dst TEXT,              -- từ đâu → đến đâu (tên học sinh hoặc lớp)
+    actor TEXT,                      -- người xác nhận
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_book ON events(book_id, at);
+CREATE INDEX IF NOT EXISTS idx_events_at ON events(at);
+-- Lượt chuyển sách giữa các lớp đã được xác nhận (theo lịch xoay vòng)
+CREATE TABLE IF NOT EXISTS transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day TEXT NOT NULL, period INTEGER NOT NULL,     -- period 99 = trả về lớp giữ cuối buổi
+    subject TEXT NOT NULL, grade INTEGER, src TEXT NOT NULL, dst TEXT NOT NULL,
+    n INTEGER NOT NULL, received INTEGER NOT NULL,
+    giver TEXT, receiver TEXT, at TEXT NOT NULL,
+    resolved_at TEXT, resolved_by TEXT,             -- khi đã tìm thấy số sách bị thiếu
+    UNIQUE(day, period, subject, grade, src, dst)
 );
 """
 
@@ -400,6 +433,49 @@ def logout():
 
 
 # ============================================================
+# Nhật ký giao nhận
+# ============================================================
+END_PERIOD = 99   # mã "tiết" cho lượt trả sách về lớp giữ cuối buổi
+
+
+def need_actor(form=None):
+    """Trả về tên người xác nhận, hoặc None (kèm thông báo) nếu chưa có – khi đó không ghi nhận giao nhận."""
+    name = current_actor(form)
+    if name == "(chưa ghi tên)":
+        flash("Nhập tên người xác nhận (ô \"Bạn là ai?\" ở đầu trang) trước khi ghi nhận giao nhận sách.", "error")
+        return None
+    return name
+
+
+def current_actor(form=None):
+    """Tên người xác nhận: lấy từ form (và nhớ cho các lần sau trong phiên), hoặc tên đã nhớ."""
+    name = ((form or {}).get("actor") or "").strip()
+    if name:
+        session["actor"] = name[:60]
+    return session.get("actor") or "(chưa ghi tên)"
+
+
+def log_event(db, kind, book=None, actor=None, **f):
+    if book is not None:
+        f.setdefault("book_id", book["id"])
+        f.setdefault("subject", book["subject"])
+        f.setdefault("grade", book["grade"])
+    db.execute("INSERT INTO events(at, kind, book_id, subject, grade, n, src, dst, actor, note) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?)",
+               (now(), kind, f.get("book_id"), f.get("subject"), f.get("grade"), f.get("n", 1),
+                f.get("src"), f.get("dst"), actor or current_actor(), f.get("note")))
+
+
+def open_shortages(db):
+    return db.execute("SELECT * FROM transfers WHERE received < n AND resolved_at IS NULL "
+                      "ORDER BY at DESC").fetchall()
+
+
+EVENT_LABELS = {"borrow": "Mượn về nhà", "return": "Trả sách", "handover": "Chuyển tay",
+                "transfer": "Chuyển lớp", "short": "Nhận thiếu", "found": "Tìm thấy", "lost": "Báo mất"}
+
+
+# ============================================================
 # Nghiệp vụ
 # ============================================================
 def active_loan(db, book_id):
@@ -637,10 +713,12 @@ MENUS = [
         ("import_page", "Nhập dữ liệu (CSV)", "upload"),
         ("lessons", "Bài tuần này", "lesson"),
         ("settings_page", "Cài đặt", "settings"),
+        ("data_page", "Xóa dữ liệu", "logout"),
     ]),
     ("Báo cáo", "loans", [
         ("dashboard", "Tổng quan", "home"),
         ("loans", "Đang mượn", "loans"),
+        ("history_page", "Nhật ký giao nhận", "loans"),
         ("export_loans", "Tải nhật ký mượn (CSV)", "upload"),
     ]),
 ]
@@ -764,6 +842,9 @@ button[disabled]{opacity:.45;cursor:not-allowed}
 .pill.ok{background:var(--ok-bg);color:var(--ok)} .pill.warn{background:var(--warn-bg);color:var(--warn)}
 .flash{padding:12px 16px;border-radius:10px;margin-bottom:14px;background:var(--ok-bg);color:var(--ok);font-weight:500}
 .flash.error{background:var(--err-bg);color:var(--err)}
+.btn.danger,button.danger{background:var(--err);color:#fff}
+.btn.danger.ghost,.del-btn{background:transparent;color:var(--err);border:1px solid var(--err)}
+.del-btn{padding:2px 10px;font-size:13px}
 .muted{color:var(--muted)} .small{font-size:14px}
 .labels{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
 .label{border:1px dashed #8890B5;border-radius:8px;padding:8px;text-align:center;background:#fff;color:#000;break-inside:avoid}
@@ -821,6 +902,14 @@ button[disabled]{opacity:.45;cursor:not-allowed}
 {% with msgs = get_flashed_messages(with_categories=true) %}
   {% for cat, m in msgs %}<div class="flash {{ cat }}">{{ m }}</div>{% endfor %}
 {% endwith %}
+{% if session.teacher and not session.actor %}
+<form method="post" action="{{ url_for('set_actor') }}" class="card noprint"
+      style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-color:var(--warn)">
+  <input type="hidden" name="next" value="{{ request.full_path if request.method == 'GET' else '' }}">
+  <b>Bạn là ai?</b> <span class="small muted">Tên này được ghi vào nhật ký mỗi lần mượn, trả, chuyển sách.</span>
+  <input name="actor" placeholder="VD: Cô Lan – GVCN 6A1" required style="width:220px;margin:0">
+  <button style="padding:6px 14px">Lưu</button>
+</form>{% endif %}
 {{ body|safe }}
 </main>
 {% if session.teacher and request.endpoint == 'today' %}<a class="fab" href="{{ url_for('scan') }}">{{ icon('scan') }}Quét sách</a>{% endif %}
@@ -911,7 +1000,7 @@ def dashboard():
         {% for c in per_class %}
         <tr><td><b>{{ c.class_name }}</b></td><td>{{ c.total }}</td><td>{{ c.own }}</td>
             <td>{{ c.no_device }}</td><td>{{ c.books }}</td><td>{{ c.out }}</td></tr>
-        {% else %}<tr><td colspan="6" class="muted">Chưa có học sinh. <a href="{{ url_for('setup', step=2) }}">Nhập danh sách học sinh</a></td></tr>{% endfor %}
+        {% else %}<tr><td colspan="7" class="muted">Chưa có học sinh. <a href="{{ url_for('setup', step=2) }}">Nhập danh sách học sinh</a></td></tr>{% endfor %}
       </table></div>
 
       <h2>Kho sách theo môn</h2>
@@ -946,8 +1035,12 @@ def book_page(book_id):
     if session.get("teacher") and not loan:
         others = db.execute("SELECT id, name, class_name FROM students WHERE has_own_book = 0 "
                             "ORDER BY class_name, name").fetchall()
-    history = db.execute("""SELECT l.*, s.name, s.class_name FROM loans l JOIN students s ON s.id = l.student_id
-                            WHERE l.book_id = ? ORDER BY l.out_at DESC LIMIT 10""", (book_id,)).fetchall()
+    history = db.execute("SELECT * FROM events WHERE book_id = ? ORDER BY id DESC LIMIT 15", (book_id,)).fetchall()
+    handover_to = []
+    if session.get("teacher") and loan:
+        handover_to = db.execute("SELECT id, name, class_name FROM students WHERE has_own_book = 0 AND id != ? "
+                                 "ORDER BY class_name = ? DESC, class_name, name",
+                                 (loan["student_id"], loan["class_name"])).fetchall()
     overdue = loan and loan["due_at"] < now()
     return page("""
       <h1>{{ b.subject }} {{ b.grade }} <span class="muted">· #{{ b.id }}</span></h1>
@@ -969,14 +1062,33 @@ def book_page(book_id):
           <p style="margin-top:0">Đang ở chỗ <b>{{ loan.name }}</b> ({{ loan.class_name }})<br>
             <span class="small muted">Mượn lúc {{ loan.out_at }} · hạn trả {{ loan.due_at }}</span></p>
           {% if session.teacher %}
-          <form method="post" action="{{ url_for('return_book', book_id=b.id) }}">
-            <label>Tình trạng khi trả
-              <select name="condition">
-                {% for c in ['Tốt','Hơi cũ','Rách/hư cần sửa','Mất'] %}
-                <option {{ 'selected' if c == b.condition }}>{{ c }}</option>{% endfor %}
-              </select></label>
-            <button class="big">Đã trả</button>
+          <form method="post" action="{{ url_for('return_book', book_id=b.id) }}"
+                onsubmit="return confirm('Xác nhận đã nhận lại cuốn #{{ b.id }} từ {{ loan.name }}?')">
+            <h2 style="margin:8px 0">Nhận sách trả</h2>
+            <div class="row">
+              <label>Tình trạng khi trả
+                <select name="condition">
+                  {% for c in ['Tốt','Hơi cũ','Rách/hư cần sửa','Mất'] %}
+                  <option {{ 'selected' if c == b.condition }}>{{ c }}</option>{% endfor %}
+                </select></label>
+              <label>Người nhận sách<input name="actor" value="{{ session.actor or '' }}" required
+                placeholder="Tên giáo viên / lớp trưởng"></label>
+            </div>
+            <label style="margin:0 0 10px"><input type="checkbox" required>Đã kiểm tra: đúng cuốn #{{ b.id }}, đủ trang</label>
+            <button class="big">✅ Xác nhận đã nhận lại</button>
           </form>
+          <details style="margin-top:14px"><summary><b>Chuyển tay cho học sinh khác</b>
+            <span class="small muted">(em này đưa thẳng cho em khác, không qua thư viện)</span></summary>
+            <form method="post" action="{{ url_for('handover', book_id=b.id) }}" style="margin-top:10px"
+                  onsubmit="return confirm('Xác nhận ' + '{{ loan.name }}' + ' đã giao cuốn #{{ b.id }} cho ' + this.student_id.selectedOptions[0].text + '?')">
+              <div class="row">
+                <label>Người nhận<select name="student_id">{% for s in handover_to %}
+                  <option value="{{ s.id }}">{{ s.class_name }} – {{ s.name }}</option>{% endfor %}</select></label>
+                <label>Người chứng kiến<input name="actor" value="{{ session.actor or '' }}" required></label>
+                <div><button class="btn ghost">Xác nhận đã giao</button></div>
+              </div>
+            </form>
+          </details>
           {% endif %}
         </div>
       {% elif session.teacher %}
@@ -1010,16 +1122,18 @@ def book_page(book_id):
           <a href="{{ ebook }}" target="_blank" rel="noopener">{{ ebook }}</a>.</div>
       {% endif %}
 
-      {% if history %}
-      <h2>Lịch sử gần đây</h2>
-      <div class="scroll"><table><tr><th>Học sinh</th><th>Mượn</th><th>Trả</th></tr>
-        {% for h in history %}<tr><td>{{ h.name }} <span class="muted small">{{ h.class_name }}</span></td>
-          <td>{{ h.out_at }}</td><td>{{ h.returned_at or '—' }}</td></tr>{% endfor %}
+      {% if history and session.teacher %}
+      <h2>Lịch sử giao nhận của cuốn này</h2>
+      <div class="scroll"><table><tr><th>Thời gian</th><th>Việc</th><th>Từ → Đến</th><th>Người xác nhận</th></tr>
+        {% for h in history %}<tr><td>{{ h.at }}</td><td>{{ labels[h.kind] }}{% if h.note %}
+          <br><span class="small muted">{{ h.note }}</span>{% endif %}</td>
+          <td>{{ h.src or '—' }} → <b>{{ h.dst or '—' }}</b></td><td>{{ h.actor }}</td></tr>{% endfor %}
       </table></div>
+      <p class="small"><a href="{{ url_for('history_page') }}">Xem nhật ký giao nhận của cả trường</a></p>
       {% endif %}
     """, b=book, loan=loan, overdue=overdue, suggestions=suggestions, others=others,
-                edition=edition, reference=reference,
-                history=history, ebook=EBOOK_HOME)
+                edition=edition, reference=reference, handover_to=handover_to,
+                history=history, labels=EVENT_LABELS, ebook=EBOOK_HOME)
 
 
 @app.post("/b/<int:book_id>/borrow")
@@ -1036,9 +1150,15 @@ def borrow(book_id):
     st = db.execute("SELECT * FROM students WHERE id = ?", (student_id,)).fetchone()
     if not st:
         abort(400)
+    actor = need_actor(request.form)
+    if not actor:
+        return redirect(safe_next() or url_for("book_page", book_id=book_id))
     due = (datetime.now() + timedelta(days=LOAN_DAYS)).replace(hour=7, minute=30).strftime("%Y-%m-%d %H:%M")
     db.execute("INSERT INTO loans(book_id, student_id, out_at, due_at) VALUES (?,?,?,?)",
                (book_id, student_id, now(), due))
+    book = db.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+    log_event(db, "borrow", book, actor=actor,
+              src=book["class_name"] or "Thư viện", dst=f"{st['name']} ({st['class_name']})", note=f"hạn trả {due}")
     db.commit()
     flash(f"Đã cho mượn: {st['name']} giữ cuốn #{book_id}, hạn trả {due}.")
     return redirect(safe_next() or url_for("book_page", book_id=book_id))
@@ -1050,13 +1170,181 @@ def return_book(book_id):
     db = get_db()
     loan = active_loan(db, book_id)
     if loan:
+        actor = need_actor(request.form)
+        if not actor:
+            return redirect(safe_next() or url_for("book_page", book_id=book_id))
+        book = db.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
         db.execute("UPDATE loans SET returned_at = ? WHERE id = ?", (now(), loan["id"]))
         cond = request.form.get("condition")
         if cond:
             db.execute("UPDATE books SET condition = ? WHERE id = ?", (cond, book_id))
+        late = " · trả muộn" if loan["due_at"] < now() else ""
+        log_event(db, "lost" if cond == "Mất" else "return", book, actor=actor,
+                  src=f"{loan['name']} ({loan['class_name']})", dst=book["class_name"] or "Thư viện",
+                  note=(f"tình trạng: {cond}" if cond else "") + late)
         db.commit()
-        flash(f"Đã trả: {loan['name']} trả cuốn #{book_id}.")
+        if cond == "Mất":
+            flash(f"Đã ghi nhận MẤT cuốn #{book_id} (đang ở chỗ {loan['name']}, người xác nhận: {actor}).", "error")
+        else:
+            flash(f"Đã nhận lại cuốn #{book_id} từ {loan['name']} (người nhận: {actor}).")
     return redirect(safe_next() or url_for("book_page", book_id=book_id))
+
+
+@app.post("/b/<int:book_id>/handover")
+@teacher_required
+def handover(book_id):
+    """Học sinh đang giữ sách giao thẳng cho học sinh khác: đóng lượt mượn cũ, mở lượt mượn mới, ghi nhật ký."""
+    db = get_db()
+    loan = active_loan(db, book_id)
+    to = db.execute("SELECT * FROM students WHERE id = ?", (request.form.get("student_id", type=int),)).fetchone()
+    if not loan or not to or to["id"] == loan["student_id"]:
+        flash("Không chuyển được: sách không đang được mượn hoặc chọn sai người nhận.", "error")
+        return redirect(url_for("book_page", book_id=book_id))
+    actor = need_actor(request.form)
+    if not actor:
+        return redirect(url_for("book_page", book_id=book_id))
+    book = db.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+    t = now()
+    due = (datetime.now() + timedelta(days=LOAN_DAYS)).replace(hour=7, minute=30).strftime("%Y-%m-%d %H:%M")
+    db.execute("UPDATE loans SET returned_at = ? WHERE id = ?", (t, loan["id"]))
+    db.execute("INSERT INTO loans(book_id, student_id, out_at, due_at) VALUES (?,?,?,?)", (book_id, to["id"], t, due))
+    log_event(db, "handover", book, actor=actor, src=f"{loan['name']} ({loan['class_name']})",
+              dst=f"{to['name']} ({to['class_name']})", note=f"hạn trả mới {due}")
+    db.commit()
+    flash(f"Đã ghi nhận: {loan['name']} giao cuốn #{book_id} cho {to['name']}.")
+    return redirect(url_for("book_page", book_id=book_id))
+
+
+# ============================================================
+# Chuyển sách giữa các lớp: xác nhận + phát hiện thiếu
+# ============================================================
+@app.post("/transfer/confirm")
+@teacher_required
+def transfer_confirm():
+    db = get_db()
+    f = request.form
+    try:
+        n, received = int(f["n"]), int(f["received"])
+        grade = int(f["grade"]) if (f.get("grade") or "").isdigit() else None
+        key = (f["day"], int(f["period"]), f["subject"], grade, f["src"], f["dst"])
+    except (KeyError, ValueError):
+        abort(400)
+    received = max(0, min(received, n))
+    receiver = (f.get("receiver") or "").strip()[:60]
+    actor = need_actor(f)
+    if not actor:
+        return redirect(safe_next() or url_for("today"))
+    if not receiver:
+        flash("Ghi tên người nhận sách ở lớp đến.", "error")
+        return redirect(safe_next() or url_for("today"))
+    db.execute("""INSERT INTO transfers(day, period, subject, grade, src, dst, n, received, giver, receiver, at)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT(day, period, subject, grade, src, dst) DO UPDATE SET
+                  n = excluded.n, received = excluded.received, giver = excluded.giver,
+                  receiver = excluded.receiver, at = excluded.at, resolved_at = NULL, resolved_by = NULL""",
+               (*key, n, received, actor, receiver, now()))
+    when = "cuối buổi" if key[1] == END_PERIOD else f"tiết {key[1]}"
+    log_event(db, "transfer" if received == n else "short", actor=actor, subject=key[2], grade=key[3],
+              n=received, src=key[4], dst=key[5],
+              note=f"{when} · giao {n}, nhận {received} · người nhận: {receiver}")
+    db.commit()
+    if received < n:
+        flash(f"Đã ghi nhận THIẾU {n - received} cuốn {key[2]} {key[3]} ({key[4]} → {key[5]}). "
+              "Cảnh báo sẽ hiện ở trang Hôm nay đến khi tìm thấy.", "error")
+    else:
+        flash(f"Đã xác nhận {key[5]} nhận đủ {n} cuốn {key[2]} {key[3]} từ {key[4]}.")
+    return redirect(safe_next() or url_for("today"))
+
+
+@app.post("/transfer/<int:tid>/resolve")
+@teacher_required
+def transfer_resolve(tid):
+    db = get_db()
+    t = db.execute("SELECT * FROM transfers WHERE id = ?", (tid,)).fetchone()
+    if not t:
+        abort(404)
+    actor = need_actor(request.form)
+    if not actor:
+        return redirect(safe_next() or url_for("today"))
+    found = request.form.get("found") == "1"
+    db.execute("UPDATE transfers SET resolved_at = ?, resolved_by = ? WHERE id = ?", (now(), actor, tid))
+    log_event(db, "found" if found else "lost", actor=actor, subject=t["subject"], grade=t["grade"],
+              n=t["n"] - t["received"], src=t["src"], dst=t["dst"],
+              note=("đã tìm thấy số sách thiếu" if found else "xác nhận mất số sách thiếu") +
+                   f" (lượt chuyển ngày {t['day']})")
+    db.commit()
+    flash("Đã ghi nhận tìm thấy sách." if found else
+          "Đã ghi nhận mất sách. Vào Kho sách đánh dấu cuốn bị mất (tình trạng: Mất).")
+    return redirect(safe_next() or url_for("today"))
+
+
+@app.post("/actor")
+@teacher_required
+def set_actor():
+    current_actor(request.form)
+    flash(f"Người xác nhận: {session.get('actor')}. Tên này được ghi vào nhật ký giao nhận.")
+    return redirect(safe_next() or url_for("today"))
+
+
+@app.route("/history")
+@teacher_required
+def history_page():
+    db = get_db()
+    cls = (request.args.get("cls") or "").strip()
+    kind = request.args.get("kind") or ""
+    day = request.args.get("day") or ""
+    where, args = [], []
+    if cls:
+        where.append("(src LIKE ? OR dst LIKE ? OR src = ? OR dst = ?)")
+        args += [f"%({cls})", f"%({cls})", cls, cls]
+    if kind in EVENT_LABELS:
+        where.append("kind = ?")
+        args.append(kind)
+    if day:
+        where.append("at LIKE ?")
+        args.append(day + "%")
+    sql = "SELECT * FROM events" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id DESC"
+    if request.args.get("format") == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["thoi_gian", "viec", "sach", "mon", "khoi", "so_cuon", "tu", "den", "nguoi_xac_nhan", "ghi_chu"])
+        for r in db.execute(sql, args):
+            w.writerow([r["at"], EVENT_LABELS.get(r["kind"], r["kind"]), r["book_id"] or "", r["subject"],
+                        r["grade"], r["n"], r["src"], r["dst"], r["actor"], r["note"]])
+        return Response("\ufeff" + buf.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=nhat_ky_giao_nhan.csv"})
+    rows = db.execute(sql + " LIMIT 500", args).fetchall()
+    classes = [r[0] for r in db.execute("SELECT DISTINCT class_name FROM students ORDER BY 1")]
+    return page("""
+      <h1>Nhật ký giao nhận</h1>
+      <p class="muted" style="margin-top:-8px">Mọi lần sách đổi chỗ đều được ghi lại cùng người xác nhận:
+        mượn về nhà, trả, chuyển tay giữa học sinh, chuyển giữa các lớp, báo thiếu, tìm thấy, báo mất.</p>
+      {% if shortages %}<div class="flash error"><b>{{ shortages|length }} lượt chuyển đang thiếu sách.</b>
+        Xử lý ở trang <a href="{{ url_for('today') }}">Hôm nay</a>.</div>{% endif %}
+      <form method="get" class="card"><div class="row">
+        <label>Lớp<select name="cls"><option value="">Tất cả</option>{% for c in classes %}
+          <option {{ 'selected' if c == cls }}>{{ c }}</option>{% endfor %}</select></label>
+        <label>Việc<select name="kind"><option value="">Tất cả</option>{% for k, v in labels.items() %}
+          <option value="{{ k }}" {{ 'selected' if k == kind }}>{{ v }}</option>{% endfor %}</select></label>
+        <label>Ngày<input type="date" name="day" value="{{ day }}"></label>
+        <div><button>Lọc</button></div>
+        <div><a class="btn ghost" href="{{ url_for('history_page', cls=cls, kind=kind, day=day, format='csv') }}">Tải CSV</a></div>
+      </div></form>
+      <div class="scroll"><table>
+        <tr><th>Thời gian</th><th>Việc</th><th>Sách</th><th>Từ → Đến</th><th>Người xác nhận</th><th>Ghi chú</th></tr>
+        {% for r in rows %}
+        <tr><td class="small">{{ r.at }}</td>
+          <td>{% if r.kind in ('short', 'lost') %}<span class="pill warn">{{ labels[r.kind] }}</span>
+              {% elif r.kind == 'found' %}<span class="pill ok">{{ labels[r.kind] }}</span>{% else %}{{ labels[r.kind] }}{% endif %}</td>
+          <td>{% if r.book_id %}<a href="{{ url_for('book_page', book_id=r.book_id) }}">#{{ r.book_id }}</a> {% endif %}
+              {{ r.subject }} {{ r.grade }}{% if r.n and r.n > 1 %} · {{ r.n }} cuốn{% endif %}</td>
+          <td>{{ r.src or '—' }} → <b>{{ r.dst or '—' }}</b></td><td>{{ r.actor }}</td>
+          <td class="small muted">{{ r.note or '' }}</td></tr>
+        {% else %}<tr><td colspan="6" class="muted">Chưa có lượt giao nhận nào{{ ' khớp bộ lọc' if cls or kind or day }}.</td></tr>{% endfor %}
+      </table></div>
+      {% if rows|length == 500 %}<p class="small muted">Hiện 500 dòng mới nhất. Tải CSV để xem đủ.</p>{% endif %}
+    """, rows=rows, classes=classes, cls=cls, kind=kind, day=day, labels=EVENT_LABELS,
+                shortages=open_shortages(db))
 
 
 # ============================================================
@@ -1094,17 +1382,23 @@ def books():
           <div><button>Thêm sách</button></div>
         </div>
       </form>
+      <form id="del-books" method="post" action="{{ url_for('books_delete') }}"
+            onsubmit="return confirm('Xóa ' + this.querySelectorAll('input[name=ids]:checked').length + ' cuốn đã chọn? Nhớ bóc nhãn QR trên sách.')"></form>
+      {% if rows %}<p class="noprint" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <label style="margin:0"><input type="checkbox" onclick="document.querySelectorAll('input[form=del-books][name=ids]:not(:disabled)').forEach(c => c.checked = this.checked)">Chọn tất cả</label>
+        <button form="del-books" class="btn danger ghost" style="padding:4px 12px">🗑 Xóa sách đã chọn</button></p>{% endif %}
       <div class="scroll"><table>
-        <tr><th>#</th><th>Môn</th><th>Khối</th><th>Lớp</th><th>Bộ sách {{ tip(tips.reference) }}</th><th>Tình trạng</th><th>Đang ở</th></tr>
+        <tr><th></th><th>#</th><th>Môn</th><th>Khối</th><th>Lớp</th><th>Bộ sách {{ tip(tips.reference) }}</th><th>Tình trạng</th><th>Đang ở</th></tr>
         {% for b in rows %}
-        <tr><td><a href="{{ url_for('book_page', book_id=b.id) }}">{{ b.id }}</a></td><td>{{ b.subject }}</td>
+        <tr><td><input type="checkbox" form="del-books" name="ids" value="{{ b.id }}" aria-label="Chọn sách {{ b.id }}"
+              {{ 'disabled title="Đang được mượn"' if b.borrower }}></td><td><a href="{{ url_for('book_page', book_id=b.id) }}">{{ b.id }}</a></td><td>{{ b.subject }}</td>
           <td>{{ b.grade }}</td><td>{{ b.class_name or '—' }}</td>
           <td>{{ b.edition or edition or '—' }}{% if b.edition and edition and b.edition != edition %}
               <span class="pill warn">tham khảo</span>{% endif %}</td><td>{{ b.condition }}</td>
           <td>{% if b.borrower %}{{ b.borrower }}
               {% if b.due_at < now %}<span class="pill warn">quá hạn</span>{% endif %}
               {% else %}<span class="pill ok">Sẵn sàng</span>{% endif %}</td></tr>
-        {% else %}<tr><td colspan="7" class="muted">Kho chưa có sách. Thêm ở form phía trên, hoặc
+        {% else %}<tr><td colspan="8" class="muted">Kho chưa có sách. Thêm ở form phía trên, hoặc
           <a href="{{ url_for('import_page') }}">nhập cả danh sách từ file CSV</a>.</td></tr>
         {% endfor %}
       </table></div>
@@ -1151,10 +1445,17 @@ def students():
         {% for c in classes %} · <a href="{{ url_for('students', cls=c) }}">{{ c }}</a>{% endfor %}</p>
       <p class="small muted">Bấm vào ô "Thiết bị" hoặc "Sách chính thức" để đổi trạng thái
         (vd khi học sinh đã nhận được sách chính thức).</p>
+      <form id="del-students" method="post" action="{{ url_for('students_delete') }}"
+            onsubmit="return confirm('Xóa ' + this.querySelectorAll('input[name=ids]:checked').length + ' học sinh đã chọn? Lịch sử mượn của các em cũng bị xóa.')"></form>
+      <input type="hidden" form="del-students" name="cls" value="{{ request.args.get('cls', '') }}">
+      {% if rows %}<p class="noprint" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <label style="margin:0"><input type="checkbox" onclick="document.querySelectorAll('input[form=del-students][name=ids]').forEach(c => c.checked = this.checked)">Chọn tất cả{{ ' lớp ' ~ request.args.get('cls') if request.args.get('cls') }}</label>
+        <button form="del-students" class="btn danger ghost" style="padding:4px 12px">🗑 Xóa học sinh đã chọn</button></p>{% endif %}
       <div class="scroll"><table>
-        <tr><th>Họ tên</th><th>Lớp</th><th>Thiết bị</th><th>Sách chính thức</th><th>Đang giữ</th><th>Số lần mượn</th></tr>
+        <tr><th></th><th>Họ tên</th><th>Lớp</th><th>Thiết bị</th><th>Sách chính thức</th><th>Đang giữ</th><th>Số lần mượn</th></tr>
         {% for s in rows %}
-        <tr><td>{{ s.name }}</td><td>{{ s.class_name }}</td>
+        <tr><td><input type="checkbox" form="del-students" name="ids" value="{{ s.id }}" aria-label="Chọn {{ s.name }}"
+              {{ 'disabled title="Đang giữ sách"' if s.holding }}></td><td>{{ s.name }}</td><td>{{ s.class_name }}</td>
           {% for field, val in [('has_device', s.has_device), ('has_own_book', s.has_own_book)] %}
           <td><form method="post" style="margin:0">
             <input type="hidden" name="action" value="toggle"><input type="hidden" name="id" value="{{ s.id }}">
@@ -1162,7 +1463,7 @@ def students():
             <button class="btn ghost" style="padding:2px 10px">{{ '✔ Có' if val else '✘ Chưa' }}</button>
           </form></td>{% endfor %}
           <td>{{ s.holding or '—' }}</td><td>{{ s.times }}</td></tr>
-        {% else %}<tr><td colspan="6" class="muted">Chưa có học sinh. Thêm ở form phía trên, hoặc
+        {% else %}<tr><td colspan="7" class="muted">Chưa có học sinh. Thêm ở form phía trên, hoặc
           <a href="{{ url_for('import_page') }}">nhập cả lớp từ file CSV</a>.</td></tr>
         {% endfor %}
       </table></div>""", rows=rows, classes=classes)
@@ -1206,6 +1507,201 @@ def export_loans():
 
 
 # ============================================================
+# Xóa dữ liệu
+# ============================================================
+def _no_reseed(db):
+    # Đã chủ động xóa thì khởi động lại không được tự nạp lại dữ liệu mẫu vào bảng trống
+    set_setting(db, "no_seed", "1")
+    set_setting(db, "sample_loaded", "0")
+
+
+def delete_students(db, ids):
+    """Xóa học sinh + lịch sử mượn của các em. Bỏ qua em đang giữ sách. Trả về (số đã xóa, tên bị bỏ qua)."""
+    ids = [int(i) for i in ids]
+    if not ids:
+        return 0, []
+    q = ",".join("?" * len(ids))
+    holding = db.execute(f"""SELECT DISTINCT s.id, s.name FROM students s JOIN loans l ON l.student_id = s.id
+                             WHERE s.id IN ({q}) AND l.returned_at IS NULL""", ids).fetchall()
+    skip = {r["id"] for r in holding}
+    ok = [i for i in ids if i not in skip]
+    if ok:
+        q = ",".join("?" * len(ok))
+        db.execute(f"DELETE FROM loans WHERE student_id IN ({q})", ok)
+        n = db.execute(f"DELETE FROM students WHERE id IN ({q})", ok).rowcount
+        _no_reseed(db)
+    else:
+        n = 0
+    return n, [r["name"] for r in holding]
+
+
+def delete_books(db, ids):
+    """Xóa sách + lịch sử mượn của cuốn đó. Bỏ qua sách đang được mượn. Trả về (số đã xóa, số bị bỏ qua)."""
+    ids = [int(i) for i in ids]
+    if not ids:
+        return 0, []
+    q = ",".join("?" * len(ids))
+    out = [r[0] for r in db.execute(f"SELECT DISTINCT book_id FROM loans WHERE book_id IN ({q}) "
+                                    "AND returned_at IS NULL", ids)]
+    ok = [i for i in ids if i not in set(out)]
+    n = 0
+    if ok:
+        q = ",".join("?" * len(ok))
+        db.execute(f"DELETE FROM loans WHERE book_id IN ({q})", ok)
+        n = db.execute(f"DELETE FROM books WHERE id IN ({q})", ok).rowcount
+        _no_reseed(db)
+    return n, out
+
+
+def flash_delete(what, n, skipped, skip_msg):
+    if n:
+        flash(f"Đã xóa {n} {what}.")
+    if skipped:
+        flash(skip_msg.format(n=len(skipped), names=", ".join(map(str, skipped[:10])) +
+                              ("…" if len(skipped) > 10 else "")), "error")
+    if not n and not skipped:
+        flash("Chưa chọn mục nào để xóa.", "error")
+
+
+@app.post("/students/delete")
+@teacher_required
+def students_delete():
+    db = get_db()
+    n, skipped = delete_students(db, request.form.getlist("ids"))
+    db.commit()
+    flash_delete("học sinh", n, skipped, "Không xóa {n} em đang giữ sách ({names}). Thu sách về trước rồi xóa.")
+    return redirect(url_for("students", cls=request.form.get("cls") or None))
+
+
+@app.post("/books/delete")
+@teacher_required
+def books_delete():
+    db = get_db()
+    n, skipped = delete_books(db, request.form.getlist("ids"))
+    db.commit()
+    flash_delete("cuốn sách", n, skipped, "Không xóa {n} cuốn đang được mượn (#{names}). Thu về trước rồi xóa.")
+    return redirect(url_for("books"))
+
+
+@app.post("/lessons/<int:lesson_id>/delete")
+@teacher_required
+def lesson_delete(lesson_id):
+    db = get_db()
+    row = db.execute("SELECT grade, week, title FROM lessons WHERE id = ?", (lesson_id,)).fetchone()
+    if row:
+        db.execute("DELETE FROM lessons WHERE id = ?", (lesson_id,))
+        _no_reseed(db)
+        db.commit()
+        flash(f"Đã xóa bài \"{row['title']}\".")
+        return redirect(url_for("lessons", grade=row["grade"], week=row["week"]))
+    return redirect(url_for("lessons"))
+
+
+DATA_KINDS = {
+    "loans_returned": ("Lịch sử mượn đã trả", "nhật ký các lượt đã trả xong; sách đang mượn giữ nguyên"),
+    "lessons": ("Bài học", "toàn bộ bài tuần này và phiếu học tập"),
+    "timetable": ("Thời khóa biểu", "của tất cả các lớp"),
+    "books": ("Kho sách", "tất cả sách không đang được mượn, kèm lịch sử mượn của chúng"),
+    "students": ("Học sinh", "tất cả học sinh không đang giữ sách, kèm lịch sử mượn của các em"),
+    "events": ("Nhật ký giao nhận", "lịch sử mượn, trả, chuyển tay, chuyển lớp; cảnh báo thiếu sách cũng bị xóa"),
+    "all": ("TOÀN BỘ dữ liệu", "học sinh, sách, lượt mượn, nhật ký, thời khóa biểu, bài học (giữ lại cài đặt)"),
+}
+
+
+@app.route("/data", methods=["GET", "POST"])
+@teacher_required
+def data_page():
+    db = get_db()
+    if request.method == "POST":
+        if (request.form.get("confirm") or "").strip().upper() != "XOA":
+            flash("Gõ chữ XOA vào ô xác nhận để xóa.", "error")
+            return redirect(url_for("data_page"))
+        kind, cls = request.form.get("kind"), (request.form.get("cls") or "").strip()
+        if kind not in DATA_KINDS and kind != "class":
+            abort(400)
+        if kind == "class":
+            sids = [r[0] for r in db.execute("SELECT id FROM students WHERE class_name = ?", (cls,))]
+            bids = [r[0] for r in db.execute("SELECT id FROM books WHERE class_name = ?", (cls,))]
+            ns, s_skip = delete_students(db, sids)
+            nb, b_skip = delete_books(db, bids)
+            nt = db.execute("DELETE FROM timetable WHERE class_name = ?", (cls,)).rowcount
+            flash(f"Lớp {cls}: đã xóa {ns} học sinh, {nb} cuốn sách, {nt} tiết thời khóa biểu.")
+            if s_skip or b_skip:
+                flash(f"Giữ lại {len(s_skip)} học sinh đang giữ sách và {len(b_skip)} cuốn đang được mượn.", "error")
+        elif kind == "loans_returned":
+            n = db.execute("DELETE FROM loans WHERE returned_at IS NOT NULL").rowcount
+            flash(f"Đã xóa {n} lượt mượn đã trả.")
+        elif kind == "events":
+            n = db.execute("DELETE FROM events").rowcount
+            db.execute("DELETE FROM transfers")
+            flash(f"Đã xóa {n} dòng nhật ký giao nhận.")
+        elif kind in ("lessons", "timetable"):
+            n = db.execute(f"DELETE FROM {kind}").rowcount
+            flash(f"Đã xóa {n} dòng {DATA_KINDS[kind][0].lower()}.")
+        elif kind == "books":
+            n, skip = delete_books(db, [r[0] for r in db.execute("SELECT id FROM books")])
+            flash_delete("cuốn sách", n, skip, "Giữ lại {n} cuốn đang được mượn.")
+        elif kind == "students":
+            n, skip = delete_students(db, [r[0] for r in db.execute("SELECT id FROM students")])
+            flash_delete("học sinh", n, skip, "Giữ lại {n} em đang giữ sách ({names}).")
+        elif kind == "all":
+            for t in ("loans", "students", "books", "timetable", "lessons", "events", "transfers"):
+                db.execute(f"DELETE FROM {t}")
+            set_setting(db, "qr_done", "0")
+            flash("Đã xóa toàn bộ dữ liệu. Bắt đầu lại ở Thiết lập ban đầu.")
+        _no_reseed(db)
+        db.commit()
+        return redirect(url_for("setup") if kind == "all" else url_for("data_page"))
+
+    counts = {t: db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              for t in ("students", "books", "loans", "timetable", "lessons", "events")}
+    counts["loans_returned"] = db.execute("SELECT COUNT(*) FROM loans WHERE returned_at IS NOT NULL").fetchone()[0]
+    counts["out"] = counts["loans"] - counts["loans_returned"]
+    classes = [r[0] for r in db.execute("SELECT class_name FROM students UNION SELECT class_name FROM books "
+                                        "WHERE class_name IS NOT NULL UNION SELECT class_name FROM timetable ORDER BY 1")]
+    return page("""
+      <h1>Xóa dữ liệu</h1>
+      <p class="muted" style="margin-top:-8px">Xóa từng học sinh / từng cuốn sách ở trang
+        <a href="{{ url_for('students') }}">Học sinh</a>, <a href="{{ url_for('books') }}">Kho sách</a>.
+        Trang này dùng để xóa hàng loạt. Dữ liệu đã xóa không khôi phục được.</p>
+      <div class="card"><b>Đang có:</b> {{ c.students }} học sinh · {{ c.books }} cuốn sách ·
+        {{ c.out }} cuốn đang được mượn · {{ c.loans_returned }} lượt mượn đã trả · {{ c.timetable }} tiết TKB ·
+        {{ c.lessons }} bài học</div>
+      <p class="small muted">Sách đang được mượn và học sinh đang giữ sách không bao giờ bị xóa, để không mất dấu sách.
+        Thu sách về trước nếu muốn xóa hết.</p>
+
+      {% macro confirm_box() %}<label style="flex:0 0 160px">Gõ <b>XOA</b> để xác nhận
+        <input name="confirm" autocomplete="off" required pattern="[Xx][Oo][Aa]"></label>{% endmacro %}
+
+      {% if classes %}
+      <h2>Xóa một lớp</h2>
+      <form method="post" class="card" onsubmit="return confirm('Xóa học sinh, sách và thời khóa biểu của lớp ' + this.cls.value + '?')">
+        <input type="hidden" name="kind" value="class">
+        <div class="row">
+          <label>Lớp<select name="cls">{% for x in classes %}<option>{{ x }}</option>{% endfor %}</select></label>
+          {{ confirm_box() }}
+          <div><button class="btn danger">Xóa lớp này</button></div>
+        </div>
+        <p class="small muted" style="margin:6px 0 0">Xóa học sinh, sách do lớp giữ và thời khóa biểu của lớp. Dùng khi nhập nhầm lớp.</p>
+      </form>{% endif %}
+
+      <h2>Xóa theo loại</h2>
+      {% for k, v in kinds.items() %}
+      <form method="post" class="card" onsubmit="return confirm('Xóa {{ v[0] }}? Không khôi phục được.')">
+        <input type="hidden" name="kind" value="{{ k }}">
+        <div class="row">
+          <div style="flex:2"><b>{{ v[0] }}</b>{% if k in c %} <span class="pill">{{ c[k] }}</span>{% endif %}
+            <br><span class="small muted">{{ v[1] }}</span></div>
+          {{ confirm_box() }}
+          <div><button class="btn {{ 'danger' if k == 'all' else 'ghost' }}">Xóa</button></div>
+        </div>
+      </form>
+      {% endfor %}
+
+    """, c=counts, classes=classes, kinds=DATA_KINDS)
+
+
+# ============================================================
 # In nhãn QR
 # ============================================================
 @app.route("/labels")
@@ -1215,9 +1711,15 @@ def labels():
     base = request.args.get("base") or request.host_url.rstrip("/")
     warn_local = "localhost" in base or "127.0.0.1" in base
     suggested = f"http://{lan_ip()}:{request.host.split(':')[-1] if ':' in request.host else 5000}"
-    cls = request.args.get("cls") or None
-    rows = db.execute("SELECT * FROM books WHERE (? IS NULL OR class_name = ?) ORDER BY class_name, subject, id",
-                      (cls, cls)).fetchall()
+    classes = [r[0] for r in db.execute("SELECT DISTINCT COALESCE(class_name, '') FROM books ORDER BY 1")]
+    total = db.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+    cls = request.args.get("cls")
+    if cls is None and total > LABELS_PER_PAGE and classes:
+        cls = classes[0]          # kho lớn: mặc định in từng lớp, tạo hàng nghìn mã QR một lúc rất chậm
+    if cls == "*":
+        cls = None
+    rows = db.execute("SELECT * FROM books WHERE (? IS NULL OR COALESCE(class_name, '') = ?) "
+                      "ORDER BY class_name, subject, id", (cls, cls)).fetchall()
     items = [dict(b=b, qr=qr_data_uri(f"{base}/b/{b['id']}")) for b in rows]
     return page("""
       <div class="noprint">
@@ -1229,7 +1731,17 @@ def labels():
         {% endif %}
         <p>Mã QR trỏ tới <b>{{ base }}/b/&lt;số sách&gt;</b>. In ra, cắt và dán vào bìa trong của sách.
           Quét bằng camera điện thoại là mở được trang mượn/trả.</p>
-        <p><button onclick="window.print()">🖨 In trang này</button></p>
+        {% if classes|length > 1 %}
+        <form method="get" style="margin:0 0 12px">
+          <input type="hidden" name="base" value="{{ base }}">
+          <label style="display:inline-flex;align-items:center;gap:8px;margin:0">In nhãn cho
+            <select name="cls" onchange="this.form.submit()" style="width:auto;display:inline-block;margin:0">
+              {% for c in classes %}<option value="{{ c }}" {{ 'selected' if c == cls }}>{{ 'Lớp ' ~ c if c else 'Thư viện (chưa gắn lớp)' }}</option>{% endfor %}
+              <option value="*" {{ 'selected' if cls is none }}>Tất cả {{ total }} cuốn{{ ' (chậm)' if total > per_page }}</option>
+            </select></label>
+          <noscript><button>Xem</button></noscript>
+        </form>{% endif %}
+        <p><button onclick="window.print()">🖨 In {{ items|length }} nhãn</button></p>
       </div>
       <div class="labels">
         {% for it in items %}
@@ -1238,7 +1750,8 @@ def labels():
           <span>Sách Chung · lớp {{ it.b.class_name or '—' }}</span></div>
         {% else %}<div class="card empty"><p>Chưa có sách nào để in nhãn.</p>
           <a class="btn" href="{{ url_for('setup', step=3) }}">Nhập sách vào kho</a></div>{% endfor %}
-      </div>""", items=items, base=base, warn_local=warn_local, suggested=suggested, cls=cls)
+      </div>""", items=items, base=base, warn_local=warn_local, suggested=suggested, cls=cls,
+                classes=classes, total=total, per_page=LABELS_PER_PAGE)
 
 
 # ============================================================
@@ -1279,6 +1792,8 @@ def lessons():
           <a class="btn" href="{{ l.ebook_url or ebook }}" target="_blank" rel="noopener">📖 Đọc SGK điện tử (miễn phí)</a>
           {% if l.worksheet_url %}<a class="btn ghost" href="{{ l.worksheet_url }}" target="_blank" rel="noopener">📝 Phiếu học tập</a>{% endif %}
         </div>
+        {% if session.teacher %}<form method="post" action="{{ url_for('lesson_delete', lesson_id=l.id) }}" style="margin:10px 0 0;text-align:right"
+              onsubmit="return confirm('Xóa bài này?')"><button class="del-btn">🗑 Xóa bài</button></form>{% endif %}
       </div>
       {% else %}<div class="card empty"><p>{% if session.teacher %}Chưa có bài học nào. Thêm bài đầu tiên ở form bên dưới
         để học sinh biết tuần này học gì.{% else %}Thầy cô chưa đăng bài cho tuần này. Trong lúc chờ, em có thể đọc
@@ -1814,7 +2329,7 @@ def setup(step=None):
                                        "quantity": f.get("quantity") or 1, "source": f.get("source")}])
                 flash(f"Đã thêm {n} cuốn {f['subject']} {f['grade']}.")
             elif action == "reset":
-                for t in ("loans", "students", "books", "timetable", "lessons"):
+                for t in ("loans", "students", "books", "timetable", "lessons", "events", "transfers"):
                     db.execute(f"DELETE FROM {t}")
                 for k, v in (("no_seed", "1"), ("sample_loaded", "0"), ("qr_done", "0")):
                     set_setting(db, k, v)
@@ -1994,14 +2509,31 @@ def today():
         return redirect(url_for("setup"))   # lần đầu đăng nhập: vào trình hướng dẫn
     closed = program_closed(db)
 
+    # Lọc theo lớp: trường lớn có hàng chục lớp, mỗi giáo viên chỉ cần thấy việc của lớp mình.
+    # Lựa chọn được nhớ trong phiên đăng nhập; ?cls= (để trống) để xem cả trường.
+    if "cls" in request.args:
+        session["today_cls"] = request.args.get("cls") or ""
+    cls_filter = session.get("today_cls") or ""
+    all_classes = [r[0] for r in db.execute("SELECT DISTINCT class_name FROM students ORDER BY 1")]
+    if cls_filter not in all_classes:
+        cls_filter = ""
+
     # 1. Đầu giờ: sách cần thu về (hạn trả hôm nay hoặc đã quá hạn)
     returns = db.execute("""SELECT l.*, s.name, s.class_name, b.subject, b.grade FROM loans l
                             JOIN students s ON s.id = l.student_id JOIN books b ON b.id = l.book_id
-                            WHERE l.returned_at IS NULL AND l.due_at <= ? ORDER BY l.due_at""",
-                         (f"{day} 23:59",)).fetchall()
+                            WHERE l.returned_at IS NULL AND l.due_at <= ?
+                              AND (? = '' OR s.class_name = ? OR b.class_name = ?) ORDER BY l.due_at""",
+                         (f"{day} 23:59", cls_filter, cls_filter, cls_filter)).fetchall()
 
     # 2. Trong giờ: lịch chuyển sách hôm nay
     plan = plan_day(db, weekday, day) if weekday in WEEKDAYS else None
+    if plan and cls_filter:
+        # Lịch vẫn tính cho cả trường (sách đi qua nhiều lớp), chỉ ẩn các dòng không liên quan lớp đang chọn
+        mine = lambda m: cls_filter in (m["src"], m["dst"])
+        plan["rows"] = {p: [r for r in rs if r["class_name"] == cls_filter] for p, rs in plan["rows"].items()}
+        plan["moves"] = {p: [m for m in ms if mine(m)] for p, ms in plan["moves"].items()}
+        plan["end_moves"] = [m for m in plan["end_moves"] if mine(m)]
+        plan["n_moves"] = sum(m["n"] for ms in plan["moves"].values() for m in ms)
     starts = period_starts(db)
     start_of = lambda p: starts[p - 1] if p - 1 < len(starts) else None
     cur_p = nxt_p = None
@@ -2021,8 +2553,10 @@ def today():
     # 3. Cuối giờ: sách còn ở trường + học sinh được gợi ý mượn về nhà
     ed = school_edition(db)
     free = db.execute(f"""SELECT b.* FROM books b WHERE b.condition != 'Mất' AND {MATCH_SQL}
+                          AND (:cls = '' OR b.class_name = :cls)
                           AND NOT EXISTS (SELECT 1 FROM loans l WHERE l.book_id = b.id AND l.returned_at IS NULL)
-                          ORDER BY COALESCE(b.class_name, 'zz'), b.grade, b.subject, b.id""", {"ed": ed}).fetchall()
+                          ORDER BY COALESCE(b.class_name, 'zz'), b.grade, b.subject, b.id""",
+                      {"ed": ed, "cls": cls_filter}).fetchall()
     groups = {}
     for b in free:
         key = (b["class_name"] or "Thư viện", b["subject"], b["grade"])
@@ -2037,8 +2571,67 @@ def today():
                          student=sug[0] if sug else None))
     lend.sort(key=lambda g: g["student"] is None)
 
+    # Lượt chuyển sách đã xác nhận hôm nay + cảnh báo thiếu sách chưa xử lý
+    done = {(t["period"], t["subject"], t["grade"], t["src"], t["dst"]): t
+            for t in db.execute("SELECT * FROM transfers WHERE day = ?", (day,))}
+    pending = 0
+    if plan and plan["periods"]:
+        for p in plan["periods"]:
+            s0 = start_of(p)
+            if s0 is not None and s0 <= minutes:          # tiết đã bắt đầu mà lượt chuyển chưa ai xác nhận
+                pending += sum(1 for m in plan["moves"][p]
+                               if (p, m["subject"], m["grade"], m["src"], m["dst"]) not in done)
+    shortages = open_shortages(db)
+    if cls_filter:
+        shortages = [t for t in shortages if cls_filter in (t["src"], t["dst"])]
+
     return page("""
+      {% macro move_item(p, m) %}{% set t = done.get((p, m.subject, m.grade, m.src, m.dst)) %}
+        <li style="margin-bottom:10px">Chuyển <b>{{ m.n }}</b> cuốn {{ m.subject }} {{ m.grade }}: {{ m.src }} → <b>{{ m.dst }}</b>
+        {% if t %}{% if t.received < t.n %} <span class="pill warn">nhận thiếu {{ t.n - t.received }}</span>
+          {% else %} <span class="pill ok">✔ đã nhận đủ</span>{% endif %}
+          <span class="small muted">· {{ t.receiver }} nhận lúc {{ t.at[11:] }}, {{ t.giver }} xác nhận</span>
+        {% elif not closed %}
+          <form method="post" action="{{ url_for('transfer_confirm') }}"
+                style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0 0"
+                onsubmit="return confirm('Xác nhận {{ m.dst }} đã nhận ' + this.received.value + '/{{ m.n }} cuốn {{ m.subject }} từ {{ m.src }}?')">
+            {% for k, v in [('day', day), ('period', p), ('subject', m.subject), ('grade', m.grade if m.grade is not none else ''),
+                            ('src', m.src), ('dst', m.dst), ('n', m.n), ('next', url_for('today'))] %}
+            <input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+            <input type="hidden" name="actor" value="{{ session.actor or '' }}">
+            <span class="small">Nhận được</span>
+            <input name="received" type="number" min="0" max="{{ m.n }}" value="{{ m.n }}" style="width:72px;margin:0" required>
+            <span class="small">/{{ m.n }} cuốn ·</span>
+            <input name="receiver" placeholder="Người nhận ở {{ m.dst }}" required style="width:190px;margin:0">
+            <button class="btn ghost" style="padding:4px 12px">Xác nhận đã nhận</button>
+          </form>{% endif %}</li>{% endmacro %}
       <h1>Hôm nay · {{ wd_name }}, {{ date_vn }}</h1>
+      {% if session.actor %}<form method="post" action="{{ url_for('set_actor') }}" class="noprint"
+            style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:-6px 0 10px">
+        <span class="small muted">Người xác nhận:</span>
+        <input name="actor" value="{{ session.actor }}" required style="width:180px;margin:0;padding:4px 8px">
+        <button class="btn ghost" style="padding:2px 10px">Đổi</button>
+      </form>{% endif %}
+      {% for t in shortages %}
+      <div class="flash error" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        <span>⚠ <b>Thiếu {{ t.n - t.received }} cuốn {{ t.subject }} {{ t.grade }}</b> khi chuyển {{ t.src }} → {{ t.dst }}
+          ({{ 'cuối buổi' if t.period == END_PERIOD else 'tiết ' ~ t.period }} ngày {{ t.day }};
+          giao: {{ t.giver }}, nhận: {{ t.receiver }}).</span>
+        {% for found, label in [('1', 'Đã tìm thấy'), ('0', 'Xác nhận mất')] %}
+        <form method="post" action="{{ url_for('transfer_resolve', tid=t.id) }}" style="margin:0"
+              onsubmit="return confirm('{{ label }} {{ t.n - t.received }} cuốn {{ t.subject }}?')">
+          <input type="hidden" name="found" value="{{ found }}"><input type="hidden" name="next" value="{{ url_for('today') }}">
+          <button class="btn ghost" style="padding:2px 10px">{{ label }}</button></form>{% endfor %}
+      </div>{% endfor %}
+      {% if all_classes|length > 1 %}
+      <form method="get" class="noprint" style="margin:-6px 0 14px">
+        <label style="display:inline-flex;align-items:center;gap:8px;margin:0">Xem việc của
+          <select name="cls" onchange="this.form.submit()" style="width:auto;display:inline-block;margin:0">
+            <option value="">Cả trường</option>
+            {% for c in all_classes %}<option value="{{ c }}" {{ 'selected' if c == cls_filter }}>Lớp {{ c }}</option>{% endfor %}
+          </select></label>
+        <noscript><button>Xem</button></noscript>
+      </form>{% endif %}
       {% if closed %}
         <div class="card" style="background:var(--ok-bg)"><b>Chương trình chuyển tiếp đã kết thúc.</b>
           Hệ thống không cho mượn thêm. <a href="{{ url_for('finish') }}">Xem lại hoặc mở lại</a></div>
@@ -2062,8 +2655,10 @@ def today():
             <td>{{ l.name }} <span class="muted small">{{ l.class_name }}</span></td>
             <td>{{ l.due_at[11:] if l.due_at[:10] == day else l.due_at }}
               {% if l.due_at < now_str %}<span class="pill warn">quá hạn</span>{% endif %}</td>
-            <td><form method="post" action="{{ url_for('return_book', book_id=l.book_id) }}" style="margin:0">
+            <td><form method="post" action="{{ url_for('return_book', book_id=l.book_id) }}" style="margin:0"
+                      onsubmit="return confirm('Xác nhận đã nhận lại cuốn #{{ l.book_id }} {{ l.subject }} từ {{ l.name }}?')">
               <input type="hidden" name="next" value="{{ url_for('today') }}">
+              <input type="hidden" name="actor" value="{{ session.actor or '' }}">
               <button class="btn ghost" style="padding:4px 12px">Đã trả</button></form></td></tr>
           {% endfor %}
         </table></div>
@@ -2086,20 +2681,23 @@ def today():
         </div>{% endif %}
         {% if nxt_p %}
         <div class="card {{ 'section-now' if phase in ('class', 'morning') }}"><b>Chuẩn bị cho tiết {{ nxt_p }}{{ ' (giờ ra chơi)' if cur_p }}</b>
-          {% if plan.moves[nxt_p] %}<ul style="margin-bottom:0">{% for m in plan.moves[nxt_p] %}
-            <li>Chuyển <b>{{ m.n }}</b> cuốn {{ m.subject }} {{ m.grade }}: {{ m.src }} → <b>{{ m.dst }}</b></li>{% endfor %}</ul>
+          {% if plan.moves[nxt_p] %}<ul style="margin-bottom:0">{% for m in plan.moves[nxt_p] %}{{ move_item(nxt_p, m) }}{% endfor %}</ul>
           {% else %}<p class="muted small" style="margin:6px 0 0">Không cần chuyển sách: sách đã ở đúng lớp.</p>{% endif %}
         </div>
-        {% elif not cur_p %}<div class="card muted">Các tiết hôm nay đã xong. Nhớ trả sách về lớp giữ:
-          {% for m in plan.end_moves %}{{ m.n }} cuốn {{ m.subject }} {{ m.src }} → {{ m.dst }}{{ '; ' if not loop.last }}{% else %}không cần chuyển gì.{% endfor %}</div>
+        {% elif not cur_p %}<div class="card"><b>Các tiết hôm nay đã xong. Trả sách về lớp giữ:</b>
+          {% if plan.end_moves %}<ul style="margin-bottom:0">{% for m in plan.end_moves %}{{ move_item(END_PERIOD, m) }}{% endfor %}</ul>
+          {% else %}<span class="muted">không cần chuyển gì.</span>{% endif %}</div>
         {% endif %}
-        <details class="card"><summary><b>Lịch cả buổi</b> · {{ plan.n_moves }} lượt chuyển,
+        {% if pending %}<div class="flash error">⚠ {{ pending }} lượt chuyển sách của các tiết đã qua chưa được xác nhận.
+          Mở <b>Lịch cả buổi</b> bên dưới để xác nhận, tránh lạc sách.</div>{% endif %}
+        <details class="card" {{ 'open' if pending }}><summary><b>Lịch cả buổi</b> · {{ plan.n_moves }} cuốn được chuyển,
           {{ plan.pct_with }}% học sinh có sách trên lớp</summary>
           {% for p in plan.periods %}
           <p style="margin:12px 0 4px"><b>Tiết {{ p }}</b>{% if not plan.moves[p] %} <span class="muted small">không cần chuyển</span>{% endif %}</p>
-          {% if plan.moves[p] %}<ul style="margin:0">{% for m in plan.moves[p] %}
-            <li>{{ m.n }} cuốn {{ m.subject }} {{ m.grade }}: {{ m.src }} → {{ m.dst }}</li>{% endfor %}</ul>{% endif %}
+          {% if plan.moves[p] %}<ul style="margin:0">{% for m in plan.moves[p] %}{{ move_item(p, m) }}{% endfor %}</ul>{% endif %}
           {% endfor %}
+          {% if plan.end_moves %}<p style="margin:12px 0 4px"><b>Cuối buổi: trả về lớp giữ</b></p>
+          <ul style="margin:0">{% for m in plan.end_moves %}{{ move_item(END_PERIOD, m) }}{% endfor %}</ul>{% endif %}
           <p><a href="{{ url_for('schedule', day=weekday) }}">Xem chi tiết và in lịch</a></p>
         </details>
       {% endif %}
@@ -2120,6 +2718,7 @@ def today():
             <td>{% if g.student %}<form method="post" action="{{ url_for('borrow', book_id=g.book.id) }}" style="margin:0">
               <input type="hidden" name="student_id" value="{{ g.student.id }}">
               <input type="hidden" name="next" value="{{ url_for('today') }}">
+              <input type="hidden" name="actor" value="{{ session.actor or '' }}">
               <button style="padding:6px 14px">Cho mượn #{{ g.book.id }}</button></form>{% endif %}</td></tr>
           {% endfor %}
         </table></div>
@@ -2128,7 +2727,9 @@ def today():
     """, wd_name=WEEKDAYS.get(weekday, "Chủ nhật"), date_vn=now_dt.strftime("%d/%m/%Y"), closed=closed, st=st,
                 left=[s for s in steps if not s["done"]], phase=phase, returns=returns, day=day,
                 now_str=now_dt.strftime("%Y-%m-%d %H:%M"), plan=plan, cur_p=cur_p, nxt_p=nxt_p, weekday=weekday,
-                has_tt=db.execute("SELECT 1 FROM timetable LIMIT 1").fetchone() is not None, lend=lend)
+                has_tt=db.execute("SELECT 1 FROM timetable LIMIT 1").fetchone() is not None, lend=lend,
+                done=done, pending=pending, shortages=shortages, END_PERIOD=END_PERIOD,
+                all_classes=all_classes, cls_filter=cls_filter)
 
 
 # ============================================================
